@@ -295,3 +295,66 @@ func TestRawIPBlockedClassifiesDestinations(t *testing.T) {
 		})
 	}
 }
+
+func TestExternalHostAllowedSupportsWildcards(t *testing.T) {
+	node := storage.Node{Target: "https://v1.uhdnow.com"}
+	tests := []struct {
+		name  string
+		hosts string
+		host  string
+		want  bool
+	}{
+		{name: "node target still matches literally", host: "v1.uhdnow.com", want: true},
+		{name: "unlisted host stays blocked", host: "v1-vod2.uhdnow.com"},
+		{name: "exact entry", hosts: "v1-vod2.uhdnow.com", host: "v1-vod2.uhdnow.com", want: true},
+		{name: "subdomain wildcard", hosts: "*.uhdnow.com", host: "v1-vod2.uhdnow.com", want: true},
+		{name: "subdomain wildcard spans depth", hosts: "*.uhdnow.com", host: "a.b.uhdnow.com", want: true},
+		{name: "subdomain wildcard skips apex", hosts: "*.uhdnow.com", host: "uhdnow.com"},
+		{name: "subdomain wildcard skips sibling zone", hosts: "*.uhdnow.com", host: "evil-uhdnow.com"},
+		{name: "subdomain wildcard skips suffix attack", hosts: "*.uhdnow.com", host: "uhdnow.com.evil.tld"},
+		{name: "label glob", hosts: "v1-vod*.uhdnow.com", host: "v1-vod2.uhdnow.com", want: true},
+		{name: "label glob stays in one label", hosts: "v1-vod*.uhdnow.com", host: "v1-vod.a.uhdnow.com"},
+		{name: "label glob respects prefix", hosts: "v1-vod*.uhdnow.com", host: "v2-vod2.uhdnow.com"},
+		{name: "label glob keeps suffix", hosts: "*-vod.uhdnow.com", host: "v1-vod.uhdnow.com", want: true},
+		{name: "entry without port rejects ported host", hosts: "*.uhdnow.com", host: "a.uhdnow.com:8443"},
+		{name: "entry with port matches", hosts: "*.uhdnow.com:8443", host: "a.uhdnow.com:8443", want: true},
+		{name: "entry with port rejects other port", hosts: "*.uhdnow.com:8443", host: "a.uhdnow.com:9000"},
+		{name: "multiple entries", hosts: "cdn.example.com,*.uhdnow.com", host: "x.uhdnow.com", want: true},
+		{name: "case insensitive", hosts: "*.UHDNow.com", host: "V1-VOD2.uhdnow.com", want: true},
+		{name: "wildcard does not match ipv6", hosts: "*.uhdnow.com", host: "[2606:4700:20::681a:770]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := config.ProxyEnv{ExternalAllowHosts: tt.hosts}
+			if got := externalHostAllowed(node, env, tt.host); got != tt.want {
+				t.Fatalf("externalHostAllowed(%q, %q) = %v, want %v", tt.hosts, tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSplitHostPortLooseHandlesWildcardsAndIPv6(t *testing.T) {
+	tests := []struct {
+		value string
+		host  string
+		port  string
+	}{
+		{value: "example.com", host: "example.com"},
+		{value: "example.com:8443", host: "example.com", port: "8443"},
+		{value: "*.example.com", host: "*.example.com"},
+		{value: "*.example.com:8443", host: "*.example.com", port: "8443"},
+		{value: "[2606:4700::1]", host: "[2606:4700::1]"},
+		{value: "[2606:4700::1]:8443", host: "[2606:4700::1]", port: "8443"},
+		{value: "2606:4700::1", host: "2606:4700::1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			host, port := SplitHostPortLoose(tt.value)
+			if host != tt.host || port != tt.port {
+				t.Fatalf("SplitHostPortLoose(%q) = (%q, %q), want (%q, %q)", tt.value, host, port, tt.host, tt.port)
+			}
+		})
+	}
+}

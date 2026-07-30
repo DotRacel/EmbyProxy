@@ -968,8 +968,9 @@ tr:last-child td{border-bottom:0}
               </div>
               <div class="form-group">
                 <label for="cfg-externalAllowHosts">允许的外部地址</label>
-                <textarea id="cfg-externalAllowHosts" placeholder="cdn.example.com&#10;media.example.net:8443"></textarea>
+                <textarea id="cfg-externalAllowHosts" placeholder="cdn.example.com&#10;media.example.net:8443&#10;*.example.com&#10;v1-vod*.example.com"></textarea>
                 <div class="form-hint">每行或逗号分隔；需要端口时请一并填写</div>
+                <div class="form-hint">支持通配符：*.example.com 匹配任意层级子域（不含 example.com 本身）；v1-vod*.example.com 只匹配单级子域；通配符不能用于顶级/二级域名、端口和 IP</div>
               </div>
               <div class="toggle-row">
                 <input type="checkbox" id="cfg-externalAllowAny"/>
