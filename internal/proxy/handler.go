@@ -258,14 +258,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	capture.SetMeta(r, map[string]any{"node": parsed.Name, "impersonated": node.Impersonate})
+	trustProxy := h.trustsProxy(ctx)
+	ctx = withTrustProxy(ctx, trustProxy)
+	r = r.WithContext(ctx)
 	requestlog.SetRequestURI(ctx, logging.RedactProxyURL(r.URL.RequestURI(), parsed.Name, node.Secret))
-	LogRequestStarted(ctx, h.log, r, auth.ClientIP(r, h.trustsProxy(ctx)), parsed.Name)
+	LogRequestStarted(ctx, h.log, r, auth.ClientIP(r, trustProxy), parsed.Name)
 	parsed.Secret = node.Secret
 	strip := 1
 	if node.Secret != "" {
 		if len(parsed.Segments) < 2 || parsed.Segments[1] != node.Secret {
 			capture.SetMeta(r, map[string]any{"node": parsed.Name, "secret": node.Secret, "stage": "invalid-secret"})
-			h.log.Warn("proxy", "invalid node secret", map[string]any{"event": "invalidNodeSecret", "node": parsed.Name, "ip": auth.ClientIP(r, h.trustsProxy(ctx))})
+			h.log.Warn("proxy", "invalid node secret", map[string]any{"event": "invalidNodeSecret", "node": parsed.Name, "ip": auth.ClientIP(r, trustProxy)})
 			http.Error(w, "Node not found", http.StatusNotFound)
 			return
 		}
@@ -613,6 +616,20 @@ func (h *Handler) requestBodyForReplay(w http.ResponseWriter, r *http.Request) (
 		return nil, nil
 	}
 	return capture.DrainAndRemember(r, h.cfg.Defaults.MaxRetryBodyBytes)
+}
+
+type trustProxyKey struct{}
+
+func withTrustProxy(ctx context.Context, trust bool) context.Context {
+	return context.WithValue(ctx, trustProxyKey{}, trust)
+}
+
+func trustProxyFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	trust, _ := ctx.Value(trustProxyKey{}).(bool)
+	return trust
 }
 
 func (h *Handler) registerPlayback(r *http.Request, in storage.PlaybackInput) {
@@ -1099,8 +1116,12 @@ func schemeHost(r *http.Request) string {
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded != "" {
-		scheme = strings.TrimSpace(strings.Split(forwarded, ",")[0])
+	// X-Forwarded-Proto is client controlled unless a trusted proxy sits in front,
+	// and the scheme ends up in origins written into rewritten payloads.
+	if trustProxyFromContext(r.Context()) {
+		if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded != "" {
+			scheme = strings.TrimSpace(strings.Split(forwarded, ",")[0])
+		}
 	}
 	return scheme + "://" + r.Host
 }
