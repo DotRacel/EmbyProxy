@@ -15,7 +15,7 @@ import (
 
 func TestImageDiskCacheExpirationUsesCurrentTTL(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	cache := newImageDiskCache(t.TempDir(), 7*24*time.Hour)
+	cache := newImageDiskCache(t.TempDir(), 7*24*time.Hour, 0)
 	meta := imageCacheMeta{
 		CreatedAt: now.Add(-2 * 24 * time.Hour).Unix(),
 		ExpiresAt: now.Add(-24 * time.Hour).Unix(),
@@ -26,7 +26,7 @@ func TestImageDiskCacheExpirationUsesCurrentTTL(t *testing.T) {
 }
 
 func TestImageDiskCacheMetadataDoesNotStoreRawKey(t *testing.T) {
-	cache := newImageDiskCache(t.TempDir(), time.Hour)
+	cache := newImageDiskCache(t.TempDir(), time.Hour, 0)
 	rawKey := "node\nhttps://upstream.example/emby/Items/1/Images/Primary?api_key=secret-token"
 	res := bytesResponse(http.StatusOK, []byte("image"), http.Header{"Content-Type": []string{"image/jpeg"}})
 	cache.wrapStore(httptestRequest(http.MethodGet), rawKey, res, res.Header)
@@ -50,7 +50,7 @@ func TestImageDiskCacheMetadataDoesNotStoreRawKey(t *testing.T) {
 
 func TestImageDiskCacheStatsCountsFilesAndEntries(t *testing.T) {
 	dir := t.TempDir()
-	cache := newImageDiskCache(dir, time.Hour)
+	cache := newImageDiskCache(dir, time.Hour, 0)
 	subdir := filepath.Join(dir, "ab")
 	if err := os.MkdirAll(subdir, 0o755); err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestImageDiskCacheStatsCountsFilesAndEntries(t *testing.T) {
 
 func TestImageDiskCacheClearRemovesFilesAndMemoryMetadata(t *testing.T) {
 	dir := t.TempDir()
-	cache := newImageDiskCache(dir, time.Hour)
+	cache := newImageDiskCache(dir, time.Hour, 0)
 	subdir := filepath.Join(dir, "ab")
 	if err := os.MkdirAll(subdir, 0o755); err != nil {
 		t.Fatal(err)
@@ -140,7 +140,7 @@ func TestImageCacheKeyIgnoresAuthQueryForSharedCache(t *testing.T) {
 func TestImageDiskCacheUsesMemoryMetadataAfterDiskRead(t *testing.T) {
 	dir := t.TempDir()
 	key := "node\nhttps://upstream.example/emby/Items/1/Images/Primary?tag=meta"
-	writer := newImageDiskCache(dir, time.Hour)
+	writer := newImageDiskCache(dir, time.Hour, 0)
 	res := bytesResponse(http.StatusOK, []byte("image"), http.Header{
 		"Content-Type": []string{"image/jpeg"},
 		"ETag":         []string{`"meta-v1"`},
@@ -153,7 +153,7 @@ func TestImageDiskCacheUsesMemoryMetadataAfterDiskRead(t *testing.T) {
 	}
 	_ = res.Body.Close()
 
-	cache := newImageDiskCache(dir, time.Hour)
+	cache := newImageDiskCache(dir, time.Hour, 0)
 	cached, ok := cache.get(httptestRequest(http.MethodGet), key, "", config.ProxyEnv{})
 	if !ok {
 		t.Fatal("first cache lookup missed")
@@ -185,7 +185,7 @@ func TestImageDiskCacheValidatesBodyBeforeFreshClientResponse(t *testing.T) {
 	setup := func(t *testing.T, tag string) (*imageDiskCache, string) {
 		t.Helper()
 		key := "node\nhttps://upstream.example/emby/Items/1/Images/Primary?tag=" + tag
-		writer := newImageDiskCache(dir, time.Hour)
+		writer := newImageDiskCache(dir, time.Hour, 0)
 		res := bytesResponse(http.StatusOK, []byte("image"), http.Header{
 			"Content-Type": []string{"image/jpeg"},
 			"ETag":         []string{`"missing-body-v1"`},
@@ -198,7 +198,7 @@ func TestImageDiskCacheValidatesBodyBeforeFreshClientResponse(t *testing.T) {
 		}
 		_ = res.Body.Close()
 
-		cache := newImageDiskCache(dir, time.Hour)
+		cache := newImageDiskCache(dir, time.Hour, 0)
 		cached, ok := cache.get(httptestRequest(http.MethodGet), key, "", config.ProxyEnv{})
 		if !ok {
 			t.Fatal("first cache lookup missed")

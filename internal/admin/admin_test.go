@@ -82,7 +82,6 @@ func TestListIncludesBuildInfo(t *testing.T) {
 
 func TestAdminIndexIncludesSortableStats(t *testing.T) {
 	wants := []string{
-		`data-stats-sort="day"`,
 		`data-stats-sort="lastActivityAt" aria-sort="descending"`,
 		`data-stats-sort="node"`,
 		`data-stats-sort="client"`,
@@ -96,6 +95,13 @@ func TestAdminIndexIncludesSortableStats(t *testing.T) {
 		if !strings.Contains(indexHTML, want) {
 			t.Fatalf("indexHTML missing %q", want)
 		}
+	}
+	// 「日期」列已经和「最近活动」重复，表头被删掉；day 只作为隐式排序回退保留。
+	if strings.Contains(indexHTML, `data-stats-sort="day"`) {
+		t.Fatal("indexHTML still renders the removed 日期 column")
+	}
+	if !strings.Contains(indexHTML, `['day', 'desc']`) {
+		t.Fatal("indexHTML lost the day sort fallback")
 	}
 }
 
@@ -867,6 +873,92 @@ func TestNormalizeExternalAllowHostsRejectsBroadWildcards(t *testing.T) {
 			got, errText := normalizeExternalAllowHosts(tt.input)
 			if errText == "" {
 				t.Fatalf("normalizeExternalAllowHosts(%q) = %q, want an error", tt.input, got)
+			}
+		})
+	}
+}
+
+func TestConfigSetImageCacheMaxMB(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(*testing.T, context.Context, *Handler)
+		payload map[string]any
+		wantErr string
+		want    int
+	}{
+		{
+			name:    "defaults when omitted",
+			payload: map[string]any{"logLevel": "info"},
+			want:    storage.DefaultImageCacheMaxMB,
+		},
+		{
+			name:    "saves explicit value",
+			payload: map[string]any{"imageCacheMaxMb": 512},
+			want:    512,
+		},
+		{
+			name:    "zero means unlimited",
+			payload: map[string]any{"imageCacheMaxMb": 0},
+			want:    0,
+		},
+		{
+			name: "legacy config without the field falls back to default instead of 0",
+			setup: func(t *testing.T, ctx context.Context, handler *Handler) {
+				t.Helper()
+				legacy := map[string]any{"logLevel": "info", "imageCacheEnabled": true, "imageCacheTtlDays": 30}
+				if err := handler.store.KV().Put(ctx, "system:config", legacy); err != nil {
+					t.Fatalf("Put() error = %v", err)
+				}
+			},
+			payload: map[string]any{"logLevel": "warn"},
+			want:    storage.DefaultImageCacheMaxMB,
+		},
+		{
+			name:    "rejects negative",
+			payload: map[string]any{"imageCacheMaxMb": -1},
+			wantErr: "图片缓存容量上限（MB，0 表示不限制）必须在 0-1048576 之间",
+		},
+		{
+			name:    "rejects too large",
+			payload: map[string]any{"imageCacheMaxMb": 1048577},
+			wantErr: "图片缓存容量上限（MB，0 表示不限制）必须在 0-1048576 之间",
+		},
+		{
+			name:    "rejects non integer",
+			payload: map[string]any{"imageCacheMaxMb": "abc"},
+			wantErr: "图片缓存容量上限（MB，0 表示不限制）必须是整数，取值范围 0-1048576",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			handler, closeStore := newConfigTestHandler(t)
+			defer closeStore()
+			if tt.setup != nil {
+				tt.setup(t, ctx, handler)
+			}
+
+			res := handler.configSet(ctx, map[string]any{"config": tt.payload})
+			if tt.wantErr != "" {
+				if res["ok"] == true || res["error"] != tt.wantErr {
+					t.Fatalf("configSet() = %+v, want error %q", res, tt.wantErr)
+				}
+				return
+			}
+			if res["ok"] != true {
+				t.Fatalf("configSet() = %+v", res)
+			}
+			got, err := handler.store.GetSystemConfig(ctx, storage.DefaultSystemConfig())
+			if err != nil {
+				t.Fatalf("GetSystemConfig() error = %v", err)
+			}
+			if got.ImageCacheMaxMB != tt.want {
+				t.Fatalf("ImageCacheMaxMB = %d, want %d", got.ImageCacheMaxMB, tt.want)
+			}
+			wantBytes := int64(tt.want) << 20
+			if got.ImageCacheMaxBytes() != wantBytes {
+				t.Fatalf("ImageCacheMaxBytes() = %d, want %d", got.ImageCacheMaxBytes(), wantBytes)
 			}
 		})
 	}

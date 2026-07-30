@@ -58,6 +58,7 @@ type SystemConfig struct {
 	ImageProxyRequestIntervalMS int    `json:"imageProxyRequestIntervalMs"`
 	ImageCacheEnabled           bool   `json:"imageCacheEnabled"`
 	ImageCacheTTLDays           int    `json:"imageCacheTtlDays"`
+	ImageCacheMaxMB             int    `json:"imageCacheMaxMb"`
 	TrafficCaptureEnabled       bool   `json:"trafficCaptureEnabled"`
 	TrafficCaptureFile          string `json:"trafficCaptureFile"`
 	TrafficCaptureBodyMax       int64  `json:"trafficCaptureBodyMax"`
@@ -78,6 +79,15 @@ const (
 	MaxLogHistoryMaxFiles           = 200
 )
 
+// 图片磁盘缓存容量上限：单位 MB，0 表示不限制。
+// 旧配置里没有 imageCacheMaxMb 字段时，GetSystemConfig 会保留 DefaultSystemConfig
+// 里的默认值（2GB），不会被解析成 0（不限制）。
+const (
+	DefaultImageCacheMaxMB = 2048
+	MinImageCacheMaxMB     = 0
+	MaxImageCacheMaxMB     = 1048576
+)
+
 var targetSplitRE = regexp.MustCompile(`\r?\n|[;,，；|]+`)
 
 func DefaultSystemConfig() SystemConfig {
@@ -93,6 +103,7 @@ func DefaultSystemConfig() SystemConfig {
 		ImageProxyRequestIntervalMS: 250,
 		ImageCacheEnabled:           false,
 		ImageCacheTTLDays:           30,
+		ImageCacheMaxMB:             DefaultImageCacheMaxMB,
 		TrafficCaptureFile:          "./data/traffic-captures.jsonl",
 		TrafficCaptureBodyMax:       262144,
 		TrafficCaptureTextTypes:     DefaultTrafficCaptureTextTypes,
@@ -111,6 +122,19 @@ func (c SystemConfig) LogHistoryLimits() (entriesPerFile int, maxFiles int) {
 		maxFiles = DefaultLogHistoryMaxFiles
 	}
 	return entriesPerFile, maxFiles
+}
+
+// ImageCacheMaxBytes 返回图片磁盘缓存的容量上限（字节），0 表示不限制。
+// 超出范围的值按边界回落，负值当作不限制。
+func (c SystemConfig) ImageCacheMaxBytes() int64 {
+	mb := c.ImageCacheMaxMB
+	if mb <= MinImageCacheMaxMB {
+		return 0
+	}
+	if mb > MaxImageCacheMaxMB {
+		mb = MaxImageCacheMaxMB
+	}
+	return int64(mb) << 20
 }
 
 type PlayStat struct {

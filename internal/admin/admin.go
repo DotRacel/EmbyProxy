@@ -1355,6 +1355,15 @@ func (h *Handler) configSet(ctx context.Context, body map[string]any) map[string
 	if _, ok := cfgMap["imageCacheEnabled"]; ok {
 		imageCacheEnabled = validators.ToBool(cfgMap["imageCacheEnabled"])
 	}
+	imageCacheMaxMB := current.ImageCacheMaxMB
+	if _, ok := cfgMap["imageCacheMaxMb"]; ok {
+		imageCacheMaxMB, errText = normalizeRangedInt(
+			cfgMap["imageCacheMaxMb"], "图片缓存容量上限（MB，0 表示不限制）",
+			storage.MinImageCacheMaxMB, storage.MaxImageCacheMaxMB)
+		if errText != "" {
+			return fail(errText)
+		}
+	}
 	cfg := storage.SystemConfig{
 		LogLevel:                    logLevel,
 		LogAccess:                   logAccess,
@@ -1374,6 +1383,7 @@ func (h *Handler) configSet(ctx context.Context, body map[string]any) map[string
 		ImageProxyRequestIntervalMS: clamp(intValue(cfgMap["imageProxyRequestIntervalMs"], current.ImageProxyRequestIntervalMS), 0, 5000),
 		ImageCacheEnabled:           imageCacheEnabled,
 		ImageCacheTTLDays:           clamp(intValue(cfgMap["imageCacheTtlDays"], current.ImageCacheTTLDays), 1, 365),
+		ImageCacheMaxMB:             imageCacheMaxMB,
 		TrafficCaptureEnabled:       boolValue(cfgMap, "trafficCaptureEnabled", current.TrafficCaptureEnabled),
 		TrafficCaptureFile:          trafficCaptureFile,
 		TrafficCaptureBodyMax:       current.TrafficCaptureBodyMax,
