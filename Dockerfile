@@ -1,10 +1,14 @@
-FROM golang:1.26.4-alpine AS build
+# Pin the build stage to the builder's own architecture and cross-compile, so a
+# multi-arch build never runs the Go toolchain under QEMU emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS build
 
 WORKDIR /src
 
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILT_AT=unknown
+ARG TARGETARCH
+ARG TARGETVARIANT
 
 COPY go.mod go.sum ./
 RUN go mod download
@@ -12,7 +16,9 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
+    GOARM=$(printf '%s' "${TARGETVARIANT}" | tr -d 'v') \
+    go build -trimpath \
     -ldflags="-s -w -X embyproxy/internal/buildinfo.Version=${VERSION} -X embyproxy/internal/buildinfo.Commit=${COMMIT} -X embyproxy/internal/buildinfo.BuiltAt=${BUILT_AT}" \
     -o /out/embyproxy ./cmd/embyproxy
 
