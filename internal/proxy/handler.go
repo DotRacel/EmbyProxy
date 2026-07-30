@@ -391,7 +391,7 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 			continue
 		}
 		status := res.StatusCode
-		if status < 500 && status != http.StatusForbidden && status != http.StatusNotFound && status != http.StatusRequestedRangeNotSatisfiable {
+		if status < 500 && status != http.StatusForbidden && status != http.StatusNotFound {
 			h.closeBody(lastRes)
 			lastRes = nil
 			capture.ClearErrorMeta(r)
@@ -428,7 +428,7 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 				continue
 			}
 			status := res.StatusCode
-			if status < 500 && status != http.StatusForbidden && status != http.StatusNotFound && status != http.StatusRequestedRangeNotSatisfiable {
+			if status < 500 && status != http.StatusForbidden && status != http.StatusNotFound {
 				h.closeBody(lastRes)
 				lastRes = nil
 				capture.ClearErrorMeta(r)
@@ -445,7 +445,7 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 	if lastRes != nil {
 		if lastErr != nil {
 			capture.SetErrorMeta(r, "target-attempt", lastErr, map[string]any{"meta": map[string]any{"targetAttemptMs": lastAttemptMS}})
-		} else if status := lastRes.StatusCode; status >= 500 || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusRequestedRangeNotSatisfiable {
+		} else if status := lastRes.StatusCode; status >= 500 || status == http.StatusForbidden || status == http.StatusNotFound {
 			capture.SetRetryableStatusMeta(r, "target-attempt", status, lastAttemptMS)
 		}
 		return lastRes, nil
