@@ -677,9 +677,11 @@ func (h *Handler) sendResponse(w http.ResponseWriter, r *http.Request, res *http
 	}
 	defer res.Body.Close()
 	copyResponseHeaders(w.Header(), res.Header, res.Uncompressed)
-	resumePlan, canResume := h.streamResumePlan(r, res)
+	resumePlan, canResume, resumeSkip := h.streamResumePlanWithReason(r, res)
 	if canResume {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", resumePlan.responseLength()))
+	} else {
+		h.logStreamResumeDisabled(r, res, resumeSkip)
 	}
 	w.WriteHeader(res.StatusCode)
 	stats := bodyCopyStats{}
@@ -856,6 +858,45 @@ func (h *Handler) logBodyCopyIssue(r *http.Request, res *http.Response, copied i
 	setBodyCopyFirstReadAccessLogFields(reqCtx, reader, true)
 	setBodyCopyAccessLogField(reqCtx, "bodyCopySide", side)
 	h.log.Warn("proxy", "response body copy interrupted", meta)
+}
+
+// logStreamResumeDisabled reports why a media response is being streamed without
+// resume protection, so an upstream that silently drops the connection mid-play
+// can be told apart from one the proxy simply chose not to guard. Restricted to
+// ranged media so ordinary API traffic stays out of the debug channel.
+func (h *Handler) logStreamResumeDisabled(r *http.Request, res *http.Response, reason string) {
+	if h == nil || h.log == nil || r == nil || res == nil || reason == "" {
+		return
+	}
+	if r.Method != http.MethodGet {
+		return
+	}
+	if res.StatusCode != http.StatusPartialContent && strings.TrimSpace(res.Header.Get("Content-Range")) == "" {
+		return
+	}
+	// A response the proxy never classified as streaming media was never a
+	// resume candidate to begin with; reporting that is noise, not a finding.
+	if streamResumeSource(res) == "" {
+		return
+	}
+	meta := map[string]any{
+		"event":        "streamResumeDisabled",
+		"status":       res.StatusCode,
+		"reason":       reason,
+		"id":           requestID(r, h.log),
+		"target":       responseLogTarget(res),
+		"contentType":  strings.TrimSpace(res.Header.Get("Content-Type")),
+		"etag":         strings.TrimSpace(streamResumeHeader(res.Header, "ETag")),
+		"lastModified": strings.TrimSpace(streamResumeHeader(res.Header, "Last-Modified")),
+		"date":         strings.TrimSpace(streamResumeHeader(res.Header, "Date")),
+		"acceptRanges": strings.TrimSpace(res.Header.Get("Accept-Ranges")),
+		"contentRange": strings.TrimSpace(res.Header.Get("Content-Range")),
+	}
+	if uri := responseCopyRequestURI(r); uri != "" {
+		meta["uri"] = uri
+	}
+	SetAccessLogField(r.Context(), "streamResumeDisabled", reason)
+	h.log.Debug("proxy", "stream resume disabled", meta)
 }
 
 func responseCopyRequestURI(r *http.Request) string {
