@@ -80,7 +80,6 @@ func ValidateNodeInput(input map[string]any) Result {
 		Rank:                rank,
 		Secret:              secret,
 		Tag:                 truncate(strings.TrimSpace(asString(input["tag"])), 64),
-		Note:                truncate(strings.TrimSpace(asString(input["note"])), 64),
 		DisplayName:         truncate(regexp.MustCompile(`\s+`).ReplaceAllString(strings.TrimSpace(asString(input["displayName"])), " "), 32),
 		DirectExternal:      ToBool(input["directExternal"]),
 		RenewDays:           renewDays,

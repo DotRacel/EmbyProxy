@@ -2,6 +2,7 @@ package logging
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -531,6 +532,122 @@ func TestLoggerEnableHistoryClosesPreviousHistory(t *testing.T) {
 		t.Fatalf("second EnableHistory() error = %v", err)
 	}
 	log.Info("test", "after", nil)
+}
+
+func TestLoggerReconfigureHistoryAppliesNewLimits(t *testing.T) {
+	log := New("debug", true)
+	historyPath := filepath.Join(t.TempDir(), "console-logs.jsonl")
+	t.Cleanup(func() { _ = log.Close() })
+	if err := log.EnableHistory(historyPath, 2, 5); err != nil {
+		t.Fatalf("EnableHistory() error = %v", err)
+	}
+	for i := 1; i <= 6; i++ {
+		log.Info("test", fmt.Sprintf("e%d", i), nil)
+	}
+	if _, err := os.Stat(rotatedLogPath(historyPath, 2)); err != nil {
+		t.Fatalf("rotated file .2 missing before reconfigure: %v", err)
+	}
+
+	if err := log.ReconfigureHistory(4, 2); err != nil {
+		t.Fatalf("ReconfigureHistory() error = %v", err)
+	}
+
+	entriesPerFile, maxFiles, ok := log.HistorySettings()
+	if !ok || entriesPerFile != 4 || maxFiles != 2 {
+		t.Fatalf("HistorySettings() = %d, %d, %v, want 4, 2, true", entriesPerFile, maxFiles, ok)
+	}
+	if _, err := os.Stat(rotatedLogPath(historyPath, 2)); !os.IsNotExist(err) {
+		t.Fatalf("rotated file .2 still present after shrinking retention: %v", err)
+	}
+	// 保留范围内的旧文件不能被清掉。
+	if got := messages(log.PageNumber(50, 1, LogFilter{}).Entries); got != "e3,e4,e5,e6" {
+		t.Fatalf("history entries after reconfigure = %q, want %q", got, "e3,e4,e5,e6")
+	}
+
+	// 新的单文件条数生效：当前文件写满 4 条才轮转。
+	log.Info("test", "e7", nil)
+	log.Info("test", "e8", nil)
+	if _, err := os.Stat(rotatedLogPath(historyPath, 1)); err != nil {
+		t.Fatalf("rotated file .1 missing before rotation: %v", err)
+	}
+	log.Info("test", "e9", nil)
+	if got := messages(log.PageNumber(50, 1, LogFilter{}).Entries); got != "e5,e6,e7,e8,e9" {
+		t.Fatalf("history entries after rotation = %q, want %q", got, "e5,e6,e7,e8,e9")
+	}
+	if _, err := os.Stat(rotatedLogPath(historyPath, 2)); !os.IsNotExist(err) {
+		t.Fatalf("rotated file .2 recreated beyond new retention: %v", err)
+	}
+}
+
+func TestLoggerHistoryReconfigureKeepsSingleOpenFile(t *testing.T) {
+	log := New("debug", true)
+	historyPath := filepath.Join(t.TempDir(), "console-logs.jsonl")
+	t.Cleanup(func() { _ = log.Close() })
+	if err := log.EnableHistory(historyPath, 2, 5); err != nil {
+		t.Fatalf("EnableHistory() error = %v", err)
+	}
+	log.Info("test", "first", nil)
+	if got := openFileHandles(t, historyPath); got != 1 {
+		t.Fatalf("open handles after EnableHistory = %d, want 1", got)
+	}
+
+	// 重复 EnableHistory 必须关掉上一份句柄，否则会泄漏 fd。
+	if err := log.EnableHistory(historyPath, 2, 5); err != nil {
+		t.Fatalf("second EnableHistory() error = %v", err)
+	}
+	log.Info("test", "second", nil)
+	if got := openFileHandles(t, historyPath); got != 1 {
+		t.Fatalf("open handles after re-enabling history = %d, want 1", got)
+	}
+
+	if err := log.ReconfigureHistory(8, 3); err != nil {
+		t.Fatalf("ReconfigureHistory() error = %v", err)
+	}
+	if got := openFileHandles(t, historyPath); got != 1 {
+		t.Fatalf("open handles after reconfigure = %d, want 1", got)
+	}
+	// 调整保留量时会先把缓冲区刷盘，避免删旧文件时丢日志。
+	data, err := os.ReadFile(historyPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !strings.Contains(string(data), "second") {
+		t.Fatalf("history file was not flushed on reconfigure: %q", string(data))
+	}
+	log.Info("test", "third", nil)
+	if got := messages(log.PageNumber(50, 1, LogFilter{}).Entries); got != "second,third" {
+		t.Fatalf("history entries after reconfigure = %q, want %q", got, "second,third")
+	}
+}
+
+func TestLoggerReconfigureHistoryWithoutHistoryIsNoop(t *testing.T) {
+	log := New("debug", true)
+	if err := log.ReconfigureHistory(500, 4); err != nil {
+		t.Fatalf("ReconfigureHistory() error = %v", err)
+	}
+	if _, _, ok := log.HistorySettings(); ok {
+		t.Fatalf("HistorySettings() ok = true, want false when history is disabled")
+	}
+}
+
+// openFileHandles 统计当前进程里指向 path 的打开文件数（Linux）。
+func openFileHandles(t *testing.T, path string) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skipf("/proc/self/fd unavailable: %v", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSuffix(target, " (deleted)") == path {
+			count++
+		}
+	}
+	return count
 }
 
 func TestLoggerClearRemovesBufferedAndHistoryEntries(t *testing.T) {

@@ -25,6 +25,7 @@ import (
 	"embyproxy/internal/config"
 	"embyproxy/internal/localtime"
 	"embyproxy/internal/logging"
+	"embyproxy/internal/probe"
 	"embyproxy/internal/proxy"
 	"embyproxy/internal/requestlog"
 	"embyproxy/internal/storage"
@@ -75,6 +76,8 @@ type Handler struct {
 	log        *logging.Logger
 	resetRoute ResetFunc
 	imageCache ImageCacheManager
+	probes     *probe.Registry
+	prober     *probe.Prober
 }
 
 func New(cfg config.Config, store *storage.Store, checker *auth.Checker, tg *telegram.Service, log *logging.Logger, reset ResetFunc, imageCaches ...ImageCacheManager) *Handler {
@@ -91,6 +94,12 @@ func New(cfg config.Config, store *storage.Store, checker *auth.Checker, tg *tel
 		resetRoute: reset,
 		imageCache: imageCache,
 	}
+}
+
+// AttachProbes 绑定上游探测采样，供面板读取延迟曲线与可用率。未绑定时相关接口返回空数据。
+func (h *Handler) AttachProbes(registry *probe.Registry, prober *probe.Prober) {
+	h.probes = registry
+	h.prober = prober
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -532,6 +541,10 @@ func (h *Handler) dispatch(ctx context.Context, uid, action string, body map[str
 		return ok(), http.StatusOK
 	case "checkStatus":
 		return h.checkStatus(ctx, uid, body), http.StatusOK
+	case "probe.summary":
+		return h.probeSummary(ctx, uid), http.StatusOK
+	case "probe.series":
+		return h.probeSeries(body), http.StatusOK
 	case "compactAll":
 		nodes, err := h.store.ListNodes(ctx, uid)
 		if err != nil {
@@ -1146,7 +1159,57 @@ func (h *Handler) checkStatus(ctx context.Context, uid string, body map[string]a
 		_ = res.Body.Close()
 		results = append(results, map[string]any{"name": nm, "target": checked, "checked": checked, "status": res.StatusCode, "ms": ms})
 	}
-	return map[string]any{"ok": true, "results": results}
+	// 顺带按上游线路各探测一次，让详情页里的单条线路延迟立即刷新，而不用等下一个采样周期。
+	if h.prober != nil {
+		for _, name := range names {
+			node, err := h.store.GetNode(ctx, uid, validators.NormalizeName(name))
+			if err != nil || node == nil {
+				continue
+			}
+			h.prober.ProbeNode(ctx, *node)
+		}
+	}
+	return map[string]any{"ok": true, "results": results, "probes": h.probeStats(ctx, uid)}
+}
+
+// probeStats 汇总所有节点的探测概况，上游线路按节点配置顺序返回。
+func (h *Handler) probeStats(ctx context.Context, uid string) []probe.NodeStats {
+	out := []probe.NodeStats{}
+	if h.probes == nil || h.store == nil {
+		return out
+	}
+	nodes, err := h.store.ListNodes(ctx, uid)
+	if err != nil {
+		return out
+	}
+	for _, node := range nodes {
+		out = append(out, h.probes.Stats(node.Name, storage.SplitTargets(node.Target)))
+	}
+	return out
+}
+
+func (h *Handler) probeSummary(ctx context.Context, uid string) map[string]any {
+	return map[string]any{
+		"ok":             true,
+		"probes":         h.probeStats(ctx, uid),
+		"intervalMs":     probe.Interval.Milliseconds(),
+		"retentionHours": int(probe.Retention.Hours()),
+		"enabled":        h.probes != nil,
+	}
+}
+
+func (h *Handler) probeSeries(body map[string]any) map[string]any {
+	name := validators.NormalizeName(body["name"])
+	if name == "" {
+		return fail("缺少节点名称")
+	}
+	hours := clamp(intValue(body["hours"], 6), 1, int(probe.Retention.Hours()))
+	buckets := clamp(intValue(body["buckets"], 72), 12, 240)
+	points := []probe.Point{}
+	if h.probes != nil {
+		points = h.probes.Series(name, time.Duration(hours)*time.Hour, buckets)
+	}
+	return map[string]any{"ok": true, "name": name, "hours": hours, "points": points}
 }
 
 func (h *Handler) tgSet(ctx context.Context, body map[string]any) map[string]any {
@@ -1265,6 +1328,23 @@ func (h *Handler) configSet(ctx context.Context, body map[string]any) map[string
 	if _, ok := cfgMap["logAccess"]; ok {
 		logAccess = validators.ToBool(cfgMap["logAccess"])
 	}
+	logHistoryEntriesPerFile, logHistoryMaxFiles := current.LogHistoryLimits()
+	if _, ok := cfgMap["logHistoryEntriesPerFile"]; ok {
+		logHistoryEntriesPerFile, errText = normalizeRangedInt(
+			cfgMap["logHistoryEntriesPerFile"], "单个日志文件条数",
+			storage.MinLogHistoryEntriesPerFile, storage.MaxLogHistoryEntriesPerFile)
+		if errText != "" {
+			return fail(errText)
+		}
+	}
+	if _, ok := cfgMap["logHistoryMaxFiles"]; ok {
+		logHistoryMaxFiles, errText = normalizeRangedInt(
+			cfgMap["logHistoryMaxFiles"], "日志保留文件数",
+			storage.MinLogHistoryMaxFiles, storage.MaxLogHistoryMaxFiles)
+		if errText != "" {
+			return fail(errText)
+		}
+	}
 	imageProxyLimitEnabled := current.ImageProxyLimitEnabled
 	if _, ok := cfgMap["imageProxyLimitEnabled"]; ok {
 		imageProxyLimitEnabled = validators.ToBool(cfgMap["imageProxyLimitEnabled"])
@@ -1276,6 +1356,8 @@ func (h *Handler) configSet(ctx context.Context, body map[string]any) map[string
 	cfg := storage.SystemConfig{
 		LogLevel:                    logLevel,
 		LogAccess:                   logAccess,
+		LogHistoryEntriesPerFile:    logHistoryEntriesPerFile,
+		LogHistoryMaxFiles:          logHistoryMaxFiles,
 		CapyStripEmby:               normalizeBinaryFlag(cfgMap["capyStripEmby"], current.CapyStripEmby),
 		EmosCompat:                  boolValue(cfgMap, "emosCompat", current.EmosCompat),
 		EmosMatchHosts:              emosMatchHosts,
@@ -1299,6 +1381,9 @@ func (h *Handler) configSet(ctx context.Context, body map[string]any) map[string
 		return fail(err.Error())
 	}
 	h.log.Configure(cfg.LogLevel, cfg.LogAccess)
+	if err := h.log.ReconfigureHistory(cfg.LogHistoryEntriesPerFile, cfg.LogHistoryMaxFiles); err != nil {
+		h.log.Warn("config", "console log history reconfigure failed", map[string]any{"event": "consoleLogHistoryReconfigureFailed", "error": err.Error()})
+	}
 	return ok()
 }
 
@@ -1350,7 +1435,6 @@ func exportNode(node storage.Node) map[string]any {
 		"fav":                 node.Fav,
 		"secret":              node.Secret,
 		"tag":                 node.Tag,
-		"note":                node.Note,
 		"displayName":         node.DisplayName,
 		"directExternal":      node.DirectExternal,
 		"renewDays":           node.RenewDays,
@@ -1507,6 +1591,24 @@ func normalizeLogLevel(value, fallback string) (string, string) {
 	default:
 		return "", "日志等级只能是 silent/error/warn/info/debug"
 	}
+}
+
+// normalizeRangedInt 解析整数配置项并做范围校验，超范围返回中文错误信息。
+func normalizeRangedInt(value any, label string, minValue, maxValue int) (int, string) {
+	text := strings.TrimSpace(asString(value))
+	if text == "" {
+		return 0, fmt.Sprintf("%s不能为空，取值范围 %d-%d", label, minValue, maxValue)
+	}
+	n := intValue(value, minValue-1)
+	if fmt.Sprint(n) != text {
+		if _, err := strconv.Atoi(text); err != nil {
+			return 0, fmt.Sprintf("%s必须是整数，取值范围 %d-%d", label, minValue, maxValue)
+		}
+	}
+	if n < minValue || n > maxValue {
+		return 0, fmt.Sprintf("%s必须在 %d-%d 之间", label, minValue, maxValue)
+	}
+	return n, ""
 }
 
 func normalizeBinaryFlag(value any, fallback string) string {
