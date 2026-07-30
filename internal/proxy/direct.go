@@ -209,6 +209,7 @@ func (h *Handler) handleDirectWithClient(ctx context.Context, r *http.Request, r
 		res.Header = rh
 		if isStreaming {
 			markStreamResumeCandidate(res, "direct")
+			h.registerStreamTraffic(r, node, res.StatusCode, rh)
 		}
 		h.closeBody(lastRes)
 		lastRes = nil
@@ -227,6 +228,16 @@ func (h *Handler) handleDirectWithClient(ctx context.Context, r *http.Request, r
 		return nil, lastErr
 	}
 	return nil, errNoResponse
+}
+
+// requestTrafficURL is the client-facing URL used to classify traffic. It is the
+// request this proxy answered, not the upstream target, so that the same
+// /playbackinfo and /sessions/playing exclusions apply everywhere.
+func requestTrafficURL(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	return r.URL.RequestURI()
 }
 
 func localForbiddenResponse(kind, target string) *http.Response {

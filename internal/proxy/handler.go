@@ -701,6 +701,45 @@ func (h *Handler) registerPlayback(r *http.Request, in storage.PlaybackInput) {
 	h.logPlayback(in)
 }
 
+// registerStreamTraffic arms byte accounting for a media response this proxy
+// streams itself, without emitting a playback event. Only handleMediaProxy and
+// handleSTRM report playback events, so the signed /__raw__ links that carry
+// rewritten media source URLs used to deliver their bytes with no PlaybackInput
+// registered at all: sendResponse counted them correctly and then
+// takePlaybackTrafficLog threw the numbers away, which is what made the media
+// stream - by far the largest share of traffic - invisible in the play stats.
+//
+// This runs once per response, before the body is touched. It reads nothing and
+// buffers nothing; the actual counting stays where it already was, in the
+// bodyCopyReader/bodyCopyWriter pair wrapped around the existing io.CopyBuffer.
+// trustProxyFromContext is used rather than a fresh config lookup so no store
+// read lands on the streaming path.
+func (h *Handler) registerStreamTraffic(r *http.Request, node storage.Node, status int, respHeader http.Header) {
+	if h == nil || h.store == nil || r == nil {
+		return
+	}
+	ctx := r.Context()
+	// A redirect we hand back untouched is fetched by the client straight from the
+	// upstream, so it is recorded as "direct" and LogPlaybackTraffic drops it rather
+	// than inventing traffic this proxy never carried.
+	mode := "proxy"
+	if isRedirectStatus(status) {
+		mode = "direct"
+	}
+	_ = registerPlaybackLog(ctx, storage.PlaybackInput{
+		Node:       node,
+		RequestIP:  auth.ClientIP(r, trustProxyFromContext(ctx)),
+		Headers:    r.Header,
+		Status:     status,
+		RespHeader: respHeader,
+		IsPlayback: true,
+		Mode:       mode,
+		RequestURL: requestTrafficURL(r),
+		Method:     r.Method,
+		OccurredAt: playbackRequestOccurredAt(ctx),
+	})
+}
+
 func (h *Handler) finishPlaybackLog(r *http.Request, inboundBytes, outboundBytes int64) {
 	if h == nil || h.store == nil || r == nil {
 		return

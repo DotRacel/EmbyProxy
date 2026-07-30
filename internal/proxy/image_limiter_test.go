@@ -129,7 +129,7 @@ func TestHandlerImageRequestLimiterUsesSystemConfig(t *testing.T) {
 	}
 }
 
-func newProxyTestStore(t *testing.T) *storage.Store {
+func newProxyTestStore(t testing.TB) *storage.Store {
 	t.Helper()
 	store, err := storage.New(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {

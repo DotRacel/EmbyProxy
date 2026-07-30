@@ -987,6 +987,42 @@ func TestLogPlaybackTrafficCountsReadAndWriteBytes(t *testing.T) {
 	}
 }
 
+// A node with 直连外链 enabled answers with a redirect and the client pulls the
+// media straight from the upstream. Those bytes never cross this proxy, so
+// recording them would be inventing traffic: "direct" traffic is dropped rather
+// than counted.
+func TestLogPlaybackTrafficIgnoresDirectMode(t *testing.T) {
+	ctx := context.Background()
+	store := newStatsTestStore(t)
+
+	traffic := PlaybackInput{
+		Node:          Node{Name: "beta"},
+		RequestIP:     "127.0.0.1",
+		Headers:       http.Header{"User-Agent": {"direct-client"}},
+		Status:        http.StatusFound,
+		IsPlayback:    true,
+		Mode:          "direct",
+		RequestURL:    "/emby/videos/1/stream",
+		Method:        http.MethodGet,
+		TrafficOnly:   true,
+		InboundBytes:  8 << 20,
+		OutboundBytes: 8 << 20,
+	}
+	if err := store.LogPlaybackTraffic(ctx, traffic); err != nil {
+		t.Fatalf("LogPlaybackTraffic() error = %v", err)
+	}
+
+	var rows int64
+	if err := store.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM play_stats WHERE node = ?
+	`, "beta").Scan(&rows); err != nil {
+		t.Fatalf("query play_stats error = %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("play_stats rows = %d; want 0 for traffic the client fetched directly", rows)
+	}
+}
+
 func TestLogPlaybackAsyncDoesNotWaitForDatabase(t *testing.T) {
 	ctx := context.Background()
 	store := newStatsTestStore(t)
