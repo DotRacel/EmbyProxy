@@ -102,7 +102,55 @@ var cdnMetadataHeaderPrefixes = []string{
 	"fly-",
 }
 
+// Hop-by-hop headers apply to a single connection and must never be forwarded
+// in either direction (RFC 7230 §6.1).
+var hopByHopHeaderNames = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"TE",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// The Connection header value additionally lists field names that are
+// hop-by-hop for this message only, so they must be resolved per message.
+func hopByHopHeaderSet(h http.Header) map[string]bool {
+	set := make(map[string]bool, len(hopByHopHeaderNames))
+	for _, name := range hopByHopHeaderNames {
+		set[strings.ToLower(name)] = true
+	}
+	for key, values := range h {
+		if !strings.EqualFold(key, "Connection") {
+			continue
+		}
+		for _, value := range values {
+			for _, token := range strings.Split(value, ",") {
+				token = strings.TrimSpace(token)
+				if token == "" {
+					continue
+				}
+				set[strings.ToLower(token)] = true
+			}
+		}
+	}
+	return set
+}
+
+func removeHopByHopHeaders(h http.Header) {
+	hopByHop := hopByHopHeaderSet(h)
+	for key := range h {
+		if hopByHop[strings.ToLower(key)] {
+			delete(h, key)
+		}
+	}
+}
+
 func stripProxyMetadataHeaders(h http.Header) {
+	removeHopByHopHeaders(h)
 headerLoop:
 	for key := range h {
 		for _, name := range clientIPHeaderNames {
@@ -295,9 +343,13 @@ func rewriteSetCookieHeaders(headers http.Header, prefix string) {
 }
 
 func copyResponseHeaders(dst http.Header, src http.Header, bodyDecoded bool) {
+	hopByHop := hopByHopHeaderSet(src)
 	for key, values := range src {
 		lower := strings.ToLower(key)
 		if lower == "transfer-encoding" {
+			continue
+		}
+		if hopByHop[lower] {
 			continue
 		}
 		if bodyDecoded && isDecodedBodyHeader(lower) {
