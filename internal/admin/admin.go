@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -142,8 +143,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+// indexETag 由嵌入的管理页内容算出，每次构建随内容变化。
+var indexETag = func() string {
+	sum := sha256.Sum256([]byte(indexHTML))
+	return fmt.Sprintf(`"%x"`, sum[:16])
+}()
+
 func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 管理页是随二进制一起发布的单文件，升级后必须立刻拿到新的。
+	// 原先既没有 Cache-Control 也没有任何校验器，浏览器与中间代理无从判断新旧，
+	// 升级容器后可能长期停在旧界面（版本号来自后端接口，所以看起来还是新的）。
+	// no-cache 表示可以缓存但每次都要回源校验，配合 ETag 未变时只回 304。
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+	w.Header().Set("ETag", indexETag)
 	http.ServeContent(w, r, "index.html", time.Time{}, strings.NewReader(indexHTML))
 }
 
