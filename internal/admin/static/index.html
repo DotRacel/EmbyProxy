@@ -2505,7 +2505,9 @@ button:disabled {
             </div>
 
             <!-- 批量操作条 -->
-            <div class="sel-bar" id="selBar" hidden>
+            <!-- 不能用 hidden 属性：浏览器 UA 样式里的 [hidden]{display:none!important}
+                 会压过作者样式的 .sel-bar.visible，默认隐藏交给 .sel-bar{display:none} -->
+            <div class="sel-bar" id="selBar">
               <div class="sel-bar-count"><strong id="selCount">0</strong> 个项目已选中</div>
               <div class="sel-bar-actions">
                 <button class="btn btn-secondary btn-sm" type="button" onclick="selectAll()">全选</button>
@@ -2516,8 +2518,6 @@ button:disabled {
                 <button class="btn btn-danger btn-sm" type="button" onclick="deleteSelected()">删除选中</button>
               </div>
             </div>
-
-            <div class="list-foot-hint" id="listFootHint">拖动卡片调整客户端里的排序<br/>选中多个可批量检测或导出</div>
           </div>
 
           <!-- 右：详情列 -->
@@ -2575,13 +2575,35 @@ button:disabled {
               <div id="statsByNode" class="kv-list">
                 <div class="empty-state is-slim"><span>暂无节点数据</span></div>
               </div>
+
+              <!-- 图片缓存概览：只读，缓存启用时才出现（见 renderStatsImageCache） -->
+              <div id="statsImageCacheBlock" hidden>
+                <hr class="rule"/>
+                <h6>图片缓存</h6>
+                <div class="bar-list" id="statsImageCache">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:6px;font-size:13px">
+                      <span class="mono" id="statsImageCacheUsed">--</span>
+                      <span class="mono" id="statsImageCacheUsage" style="flex:none;color:rgba(233,233,237,.5)">--</span>
+                    </div>
+                    <div class="bar"><div class="bar-fill" id="statsImageCacheBar" style="width:0%"></div></div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;gap:12px;font-size:13px">
+                    <span>缓存条目</span>
+                    <span class="mono" id="statsImageCacheEntries" style="flex:none;color:rgba(233,233,237,.6)">--</span>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;gap:12px;font-size:13px">
+                    <span>容量上限</span>
+                    <span class="mono" id="statsImageCacheLimit" style="flex:none;color:rgba(233,233,237,.6)">--</span>
+                  </div>
+                </div>
+              </div>
             </section>
           </div>
 
           <div class="table-wrap">
             <table class="table" id="statsTable">
               <thead><tr>
-                <th data-stats-sort="day" aria-sort="none"><button type="button" class="stats-sort-button" onclick="setStatsSort('day')"><span>日期</span><span class="stats-sort-indicator" aria-hidden="true"></span></button></th>
                 <th data-stats-sort="lastActivityAt" aria-sort="descending"><button type="button" class="stats-sort-button" onclick="setStatsSort('lastActivityAt')"><span>最近活动</span><span class="stats-sort-indicator" aria-hidden="true">▼</span></button></th>
                 <th data-stats-sort="node" aria-sort="none"><button type="button" class="stats-sort-button" onclick="setStatsSort('node')"><span>Emby 节点</span><span class="stats-sort-indicator" aria-hidden="true"></span></button></th>
                 <th data-stats-sort="client" aria-sort="none"><button type="button" class="stats-sort-button" onclick="setStatsSort('client')"><span>客户端</span><span class="stats-sort-indicator" aria-hidden="true"></span></button></th>
@@ -2975,10 +2997,15 @@ button:disabled {
                 <span class="tag tag-neutral">缓存</span>
               </div>
               <div class="cfg-card-fields">
-                <div class="field form-full">
+                <div class="field">
                   <label for="cfg-imageCacheTtlDays">缓存保留时长（天）</label>
                   <input class="input mono" type="number" id="cfg-imageCacheTtlDays" min="1" max="365" step="1"/>
                   <div class="form-hint">关闭时不读写磁盘缓存；开启后图片最多保留该天数，默认 30 天</div>
+                </div>
+                <div class="field">
+                  <label for="cfg-imageCacheMaxMb">容量上限（MB）</label>
+                  <input class="input mono" type="number" id="cfg-imageCacheMaxMb" min="0" max="1048576" step="128"/>
+                  <div class="form-hint">超过上限按最近最少使用（LRU）淘汰，默认 2048MB（2GB），填 0 表示不限制</div>
                 </div>
               </div>
               <div class="cache-ops">
@@ -2989,6 +3016,10 @@ button:disabled {
                 <div class="kpi">
                   <div class="mono kpi-val" id="imageCacheEntries">--</div>
                   <div class="kpi-lbl">缓存条目</div>
+                </div>
+                <div class="kpi">
+                  <div class="mono kpi-val" id="imageCacheUsage">--</div>
+                  <div class="kpi-lbl">容量占用</div>
                 </div>
                 <div class="cache-actions">
                   <button type="button" class="btn btn-secondary btn-sm" onclick="refreshImageCacheStats()">刷新状态</button>
@@ -3391,7 +3422,6 @@ const PROBE_POLL_MS = 30000;
 const DETAIL_SERIES_HOURS = 6;
 const RELATIVE_TICK_MS = 1000;
 const STATS_SORT_DEFAULT_DIRECTIONS = {
-  day: 'desc',
   lastActivityAt: 'desc',
   node: 'asc',
   client: 'asc',
@@ -4319,12 +4349,6 @@ function updateSelBar() {
   const count = document.getElementById('selCount');
   if (count) count.textContent = n;
   if (bar) bar.classList.toggle('visible', n > 0);
-  const hint = document.getElementById('listFootHint');
-  if (hint) {
-    hint.innerHTML = n > 0
-      ? `已选中 ${n} 个节点<br>可批量检测、打标签或导出`
-      : '拖动卡片调整客户端里的排序<br>选中多个可批量检测或导出';
-  }
 }
 
 function selectAll() {
@@ -5046,8 +5070,12 @@ function statsKpi(value, unit, label) {
 async function loadStats() {
   const days = statsRangeDays();
   syncStatsRangeControls();
+  // 图片缓存状态和播放统计并发拉，别串行等；失败就把那一块藏起来。
+  const cachePending = api('imageCache.stats')
+    .then(res => renderStatsImageCache(res && res.ok ? res.cache : null))
+    .catch(() => renderStatsImageCache(null));
   const r = await api('stats.get', { days });
-  if (!r.ok) { toast('加载统计失败', 'err'); return; }
+  if (!r.ok) { toast('加载统计失败', 'err'); await cachePending; return; }
   statsRows = Array.isArray(r.stats) ? r.stats : [];
 
   let totalPlays = 0, totalSessions = 0, totalPlaybackMillis = 0, totalInboundBytes = 0, totalOutboundBytes = 0;
@@ -5086,6 +5114,38 @@ async function loadStats() {
   renderStatsClients();
   renderStatsByNode();
   renderStatsTable();
+  await cachePending;
+}
+
+/* 统计页的图片缓存概览（只读）。数据来自设置页同一个 imageCache.stats，
+ * 关闭缓存时整块隐藏；这里只改文本和进度条宽度，不重建 DOM，
+ * 所以反复切换时间范围也不会闪。 */
+function renderStatsImageCache(cache) {
+  const block = document.getElementById('statsImageCacheBlock');
+  if (!block) return;
+  if (!cache || cache.enabled !== true) { block.hidden = true; return; }
+  const bytes = Math.max(0, Number(cache.bytes || 0));
+  const maxBytes = Math.max(0, Number(cache.maxBytes || 0));
+  const ratio = maxBytes > 0 ? Math.min(bytes / maxBytes, 1) : 0;
+  const near = maxBytes > 0 && ratio > 0.9;
+
+  const used = document.getElementById('statsImageCacheUsed');
+  if (used) used.textContent = formatBytes(bytes);
+  const entries = document.getElementById('statsImageCacheEntries');
+  if (entries) entries.textContent = `${formatCacheNumber(cache.entries)} 项`;
+  const limit = document.getElementById('statsImageCacheLimit');
+  if (limit) limit.textContent = maxBytes > 0 ? formatBytes(maxBytes) : '不限制';
+  const usage = document.getElementById('statsImageCacheUsage');
+  if (usage) {
+    usage.textContent = maxBytes > 0 ? `${Math.round(ratio * 100)}%` : '不限容量';
+    usage.style.color = near ? 'var(--color-warn)' : 'rgba(233,233,237,.5)';
+  }
+  const bar = document.getElementById('statsImageCacheBar');
+  if (bar) {
+    bar.style.width = `${(ratio * 100).toFixed(1)}%`;
+    bar.style.background = near ? 'var(--color-warn)' : '';
+  }
+  block.hidden = false;
 }
 
 /* 按天聚合：accent 实线为播放次数，虚线为出站流量，两条各自归一化到同一画布高度 */
@@ -5223,8 +5283,8 @@ function renderStatsTable() {
   const tbody = document.getElementById('statsBody');
   if (!tbody) return;
   tbody.innerHTML = stats.length ? stats.map(s => `
-    <tr><td class="mono">${esc(s.day)}</td><td class="mono">${esc(formatStatsActivity(s))}</td><td>${esc(s.node)}</td><td class="mono">${esc(s.client)}</td><td class="mono">${esc(s.plays)}</td><td class="mono">${esc(s.sessions)}</td><td class="mono">${esc(formatPlaybackDuration(statsPlaybackMillis(s)))}</td><td class="mono">${esc(formatBytes(trafficInboundBytes(s)))}</td><td class="mono">${esc(formatBytes(trafficOutboundBytes(s)))}</td></tr>
-  `).join('') : '<tr><td class="table-empty" colspan="9">暂无数据</td></tr>';
+    <tr><td class="mono">${esc(formatStatsActivity(s))}</td><td>${esc(s.node)}</td><td class="mono">${esc(s.client)}</td><td class="mono">${esc(s.plays)}</td><td class="mono">${esc(s.sessions)}</td><td class="mono">${esc(formatPlaybackDuration(statsPlaybackMillis(s)))}</td><td class="mono">${esc(formatBytes(trafficInboundBytes(s)))}</td><td class="mono">${esc(formatBytes(trafficOutboundBytes(s)))}</td></tr>
+  `).join('') : '<tr><td class="table-empty" colspan="8">暂无数据</td></tr>';
   updateStatsSortHeaders();
 }
 
@@ -6112,6 +6172,7 @@ async function openConfigModal() {
   document.getElementById('cfg-imageProxyRequestIntervalMs').value = c.imageProxyRequestIntervalMs ?? 250;
   document.getElementById('cfg-imageCacheEnabled').checked = c.imageCacheEnabled === true;
   document.getElementById('cfg-imageCacheTtlDays').value = c.imageCacheTtlDays ?? 30;
+  document.getElementById('cfg-imageCacheMaxMb').value = c.imageCacheMaxMb ?? 2048;
   document.getElementById('cfg-corsAllowOrigin').value = formatCORSAllowOrigin(c.corsAllowOrigin);
   document.getElementById('cfg-externalAllowHosts').value = formatExternalAllowHosts(c.externalAllowHosts);
   document.getElementById('cfg-externalAllowAny').checked = !!c.externalAllowAny;
@@ -6216,14 +6277,22 @@ function scrollConfigGroup(id, btn) {
 function renderImageCacheStats(cache) {
   const bytesEl = document.getElementById('imageCacheBytes');
   const entriesEl = document.getElementById('imageCacheEntries');
+  const usageEl = document.getElementById('imageCacheUsage');
   if (!bytesEl || !entriesEl) return;
   if (!cache) {
     bytesEl.textContent = '--';
     entriesEl.textContent = '--';
+    if (usageEl) { usageEl.textContent = '--'; usageEl.style.color = ''; }
     return;
   }
   bytesEl.textContent = formatBytes(cache.bytes);
   entriesEl.textContent = `${formatCacheNumber(cache.entries)} 项`;
+  if (usageEl) {
+    const maxBytes = Math.max(0, Number(cache.maxBytes || 0));
+    const ratio = maxBytes > 0 ? Math.min(Math.max(0, Number(cache.bytes || 0)) / maxBytes, 1) : 0;
+    usageEl.textContent = maxBytes > 0 ? `${Math.round(ratio * 100)}%` : '不限制';
+    usageEl.style.color = maxBytes > 0 && ratio > 0.9 ? 'var(--color-warn)' : '';
+  }
 }
 
 async function refreshImageCacheStats(showToast = true) {
@@ -6356,6 +6425,7 @@ async function saveConfig() {
     imageProxyRequestIntervalMs: parseInt(document.getElementById('cfg-imageProxyRequestIntervalMs').value || '250'),
     imageCacheEnabled: document.getElementById('cfg-imageCacheEnabled').checked,
     imageCacheTtlDays: parseInt(document.getElementById('cfg-imageCacheTtlDays').value || '30'),
+    imageCacheMaxMb: parseInt(document.getElementById('cfg-imageCacheMaxMb').value || '2048'),
     corsAllowOrigin: document.getElementById('cfg-corsAllowOrigin').value.trim(),
     externalAllowHosts: document.getElementById('cfg-externalAllowHosts').value.trim(),
     externalAllowAny: document.getElementById('cfg-externalAllowAny').checked,
