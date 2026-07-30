@@ -126,6 +126,10 @@ type LogEntry struct {
 type LogFilter struct {
 	Levels map[string]bool
 	Query  string
+	// Node 与 Query 是两个独立维度，同时给出时取交集。
+	// 合成一个 query 的话，节点筛选和搜索词只能二选一下推到服务端，
+	// 另一个退化成客户端当前页过滤，分页总数就不准了。
+	Node string
 }
 
 type LogPage struct {
@@ -160,15 +164,20 @@ type logHistory struct {
 }
 
 func (f LogFilter) empty() bool {
-	return len(f.Levels) == 0 && strings.TrimSpace(f.Query) == ""
+	return len(f.Levels) == 0 && strings.TrimSpace(f.Query) == "" && strings.TrimSpace(f.Node) == ""
 }
 
 func (f LogFilter) match(e LogEntry) bool {
 	if len(f.Levels) > 0 && !f.Levels[strings.ToLower(e.Level)] {
 		return false
 	}
+	line := strings.ToLower(e.Line)
 	query := strings.TrimSpace(strings.ToLower(f.Query))
-	if query != "" && !strings.Contains(strings.ToLower(e.Line), query) {
+	if query != "" && !strings.Contains(line, query) {
+		return false
+	}
+	node := strings.TrimSpace(strings.ToLower(f.Node))
+	if node != "" && !strings.Contains(line, node) {
 		return false
 	}
 	return true

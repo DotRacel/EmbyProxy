@@ -526,21 +526,6 @@ func (h *Handler) dispatch(ctx context.Context, uid, action string, body map[str
 			return fail(err.Error()), http.StatusInternalServerError
 		}
 		return map[string]any{"ok": true, "fav": node.Fav}, http.StatusOK
-	case "saveOrder":
-		order := arrayStrings(body["order"])
-		if len(order) == 0 {
-			order = arrayStrings(body["names"])
-		}
-		for i, name := range order {
-			nm := validators.NormalizeName(name)
-			node, _ := h.store.GetNode(ctx, uid, nm)
-			if node != nil {
-				rank := i + 1
-				node.Rank = &rank
-				_ = h.store.SaveNode(ctx, uid, *node)
-			}
-		}
-		return ok(), http.StatusOK
 	case "batchTag":
 		tag := validators.ValidateTag(body["tag"])
 		for _, name := range arrayStrings(body["names"]) {
@@ -963,7 +948,10 @@ func (h *Handler) listLogs(body map[string]any) map[string]any {
 	limit := clamp(intValue(body["limit"], h.log.BufferCapacity()), 1, h.log.BufferCapacity())
 	pageNumber := intValue(body["page"], 0)
 	level := strings.ToLower(strings.TrimSpace(asString(body["level"])))
-	filter := logging.LogFilter{Query: strings.ToLower(strings.TrimSpace(asString(body["query"])))}
+	filter := logging.LogFilter{
+		Query: strings.ToLower(strings.TrimSpace(asString(body["query"]))),
+		Node:  strings.ToLower(strings.TrimSpace(asString(body["node"]))),
+	}
 	if level != "" && level != "all" {
 		filter.Levels = map[string]bool{level: true}
 	}
@@ -1062,9 +1050,6 @@ func (h *Handler) save(ctx context.Context, uid string, body map[string]any) map
 		if prevNode, ok := storage.UnpackNode(prevName, prevPacked); ok {
 			if _, hasFav := raw["fav"]; !hasFav {
 				node.Fav = prevNode.Fav
-			}
-			if _, hasRank := raw["rank"]; !hasRank {
-				node.Rank = prevNode.Rank
 			}
 		}
 	}
@@ -1469,9 +1454,6 @@ func exportNode(node storage.Node) map[string]any {
 		"keepaliveChangeOnly": node.KeepaliveChangeOnly,
 		"impersonate":         node.Impersonate,
 		"impersonateProfile":  node.ImpersonateProfile,
-	}
-	if node.Rank != nil {
-		out["rank"] = *node.Rank
 	}
 	return out
 }
