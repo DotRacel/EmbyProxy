@@ -1204,7 +1204,9 @@ func (h *Handler) probeSeries(body map[string]any) map[string]any {
 		return fail("缺少节点名称")
 	}
 	hours := clamp(intValue(body["hours"], 6), 1, int(probe.Retention.Hours()))
-	buckets := clamp(intValue(body["buckets"], 72), 12, 240)
+	// 桶宽要能对齐采样周期：探测每分钟一次，桶宽比它粗的话连续多个采样会塌进同一个桶，
+	// 曲线要等好几个周期才出得来。上限按 24 小时窗口 × 每分钟一个桶留足。
+	buckets := clamp(intValue(body["buckets"], hours*60), 12, 1440)
 	points := []probe.Point{}
 	if h.probes != nil {
 		points = h.probes.Series(name, time.Duration(hours)*time.Hour, buckets)

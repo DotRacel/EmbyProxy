@@ -3387,6 +3387,8 @@ let detailEventsToken = 0;
 const LOG_PAGE_LIMIT = 2000;
 const LOG_DOM_LIMIT = 4000;
 const PROBE_POLL_MS = 30000;
+/* 详情页延迟曲线的时间窗口（小时）。桶宽 = 窗口/桶数，取每分钟一个桶以对齐探测周期。 */
+const DETAIL_SERIES_HOURS = 6;
 const RELATIVE_TICK_MS = 1000;
 const STATS_SORT_DEFAULT_DIRECTIONS = {
   day: 'desc',
@@ -4061,6 +4063,9 @@ async function loadProbes() {
   renderNodeDetail();
   renderHeadStatus();
   refreshUpstreamRowStates();
+  // 曲线数据必须一起刷新：renderNodeDetail 用的是缓存的 detailSeries，
+  // 不重新拉取的话，详情页打开那一刻的快照会一直显示下去（早期就是「采样中」卡死不动）。
+  if (selectedNodeName) loadNodeSeries(selectedNodeName);
 }
 
 async function loadTodayTraffic() {
@@ -4447,7 +4452,8 @@ function detailTargetsMarkup(node, stat) {
 async function loadNodeSeries(name) {
   if (!name) return;
   const token = ++detailSeriesToken;
-  const r = await api('probe.series', { name, hours: 6, buckets: 72 });
+  // 桶宽对齐探测周期（每分钟一个桶），否则连续多个采样会塌进同一个桶，曲线迟迟出不来。
+  const r = await api('probe.series', { name, hours: DETAIL_SERIES_HOURS, buckets: DETAIL_SERIES_HOURS * 60 });
   if (token !== detailSeriesToken || selectedNodeName !== name) return;
   if (!r.ok) {
     detailSeries = { name, points: [] };
@@ -4473,7 +4479,8 @@ function renderDetailChart() {
   // 在 preserveAspectRatio="none" 下还会被横向拉伸成一道竖线。直接说明还在采样。
   if (valid.length < 2) {
     const hint = valid.length
-      ? `采样中 · 已有 ${valid.length} 个数据点，约 ${Math.max(1, Math.round(PROBE_POLL_MS / 60000) * 2)} 分钟后显示曲线`
+      // 等待时间取决于后台探测周期（probeMeta.intervalMs），跟前端轮询无关。
+      ? `采样中 · 已有 ${valid.length} 个数据点，再过约 ${Math.max(1, Math.round(Number(probeMeta?.intervalMs || 60000) / 60000))} 分钟出现曲线`
       : '暂无采样数据';
     el.innerHTML = `<div class="text-muted" style="font-size:12px;padding:26px 0;text-align:center">${esc(hint)}</div>`;
     if (maxEl) maxEl.textContent = valid.length ? `当前 ${Math.round(valid[0])} ms` : '';
