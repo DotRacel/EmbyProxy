@@ -110,19 +110,17 @@ func (h *Handler) handleDirectWithClient(ctx context.Context, r *http.Request, r
 			lastErr = err
 			continue
 		}
-		if rg := r.Header.Get("Range"); rg != "" {
-			if rangeStartZero(rg) && ((res.StatusCode != http.StatusPartialContent && res.Header.Get("Content-Range") == "") || res.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
-				_ = res.Body.Close()
-				hNoRange := cloneHeader(headers)
-				hNoRange.Del("Range")
-				hNoRange.Del("If-Range")
-				currentHeaders = hNoRange
-				capture.SetMeta(r, map[string]any{"mode": "direct", "node": directNodeName(nodeName), "stage": "direct-retry-no-range", "targetUrl": targetURL, "outboundHeaders": hNoRange})
-				res, err = h.doFetch(ctx, client, u, method, hNoRange, body)
-				if err != nil {
-					lastErr = err
-					continue
-				}
+		if shouldRetryWithoutRange(r.Header.Get("Range"), res) {
+			_ = res.Body.Close()
+			hNoRange := cloneHeader(headers)
+			hNoRange.Del("Range")
+			hNoRange.Del("If-Range")
+			currentHeaders = hNoRange
+			capture.SetMeta(r, map[string]any{"mode": "direct", "node": directNodeName(nodeName), "stage": "direct-retry-no-range", "targetUrl": targetURL, "outboundHeaders": hNoRange})
+			res, err = h.doFetch(ctx, client, u, method, hNoRange, body)
+			if err != nil {
+				lastErr = err
+				continue
 			}
 		}
 		if res.StatusCode == http.StatusForbidden && int64(len(body)) <= h.cfg.Defaults.MaxRetryBodyBytes {
@@ -147,19 +145,17 @@ func (h *Handler) handleDirectWithClient(ctx context.Context, r *http.Request, r
 				continue
 			}
 		}
-		if rg := r.Header.Get("Range"); rg != "" && !isRetryableProtocolStatus(res.StatusCode) {
-			if rangeStartZero(rg) && ((res.StatusCode != http.StatusPartialContent && res.Header.Get("Content-Range") == "") || res.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
-				_ = res.Body.Close()
-				hNoRange := cloneHeader(currentHeaders)
-				hNoRange.Del("Range")
-				hNoRange.Del("If-Range")
-				currentHeaders = hNoRange
-				capture.SetMeta(r, map[string]any{"mode": "direct", "node": directNodeName(nodeName), "stage": "direct-retry-no-range-2", "targetUrl": targetURL, "outboundHeaders": hNoRange})
-				res, err = h.doFetch(ctx, client, u, method, hNoRange, body)
-				if err != nil {
-					lastErr = err
-					continue
-				}
+		if !isRetryableProtocolStatus(res.StatusCode) && shouldRetryWithoutRange(r.Header.Get("Range"), res) {
+			_ = res.Body.Close()
+			hNoRange := cloneHeader(currentHeaders)
+			hNoRange.Del("Range")
+			hNoRange.Del("If-Range")
+			currentHeaders = hNoRange
+			capture.SetMeta(r, map[string]any{"mode": "direct", "node": directNodeName(nodeName), "stage": "direct-retry-no-range-2", "targetUrl": targetURL, "outboundHeaders": hNoRange})
+			res, err = h.doFetch(ctx, client, u, method, hNoRange, body)
+			if err != nil {
+				lastErr = err
+				continue
 			}
 		}
 		if isRetryableProtocolStatus(res.StatusCode) {
@@ -206,6 +202,7 @@ func (h *Handler) handleDirectWithClient(ctx context.Context, r *http.Request, r
 		capture.SetMeta(r, map[string]any{"mode": "direct", "node": directNodeName(nodeName), "stage": "direct-completed", "targetUrl": targetURL, "outboundHeaders": currentHeaders})
 		responseReadyMs := time.Since(started).Milliseconds()
 		formattedTarget := logging.FormatTarget(targetURL)
+		recordUpstreamProto(ctx, res)
 		h.logResponseReady("direct", res.StatusCode, withAccessLogFields(ctx, map[string]any{"event": "upstreamReady", "id": requestID, "node": nodeName, "target": formattedTarget, "status": res.StatusCode, "responseReadyMs": responseReadyMs}))
 		SetAccessLogField(ctx, "responseReadyMs", responseReadyMs)
 		MarkAccessLogResponseBodyStart(ctx, time.Now())
@@ -268,6 +265,20 @@ func isDirectStreamingMedia(r *http.Request, targetURL *url.URL, headers http.He
 		}
 	}
 	return status == http.StatusPartialContent || strings.TrimSpace(headers.Get("Content-Range")) != ""
+}
+
+// shouldRetryWithoutRange reports whether a request that asked for the whole
+// body from offset zero has to be refetched without Range. A 2xx/3xx reply
+// without Content-Range is a valid full-body answer from an upstream that
+// simply ignores Range, so only actual failures are worth a second fetch.
+func shouldRetryWithoutRange(rangeHeader string, res *http.Response) bool {
+	if res == nil || !rangeStartZero(rangeHeader) {
+		return false
+	}
+	if res.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		return true
+	}
+	return res.StatusCode >= 400 && res.Header.Get("Content-Range") == ""
 }
 
 func rangeStartZero(value string) bool {

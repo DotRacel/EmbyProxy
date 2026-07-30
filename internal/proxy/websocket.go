@@ -185,10 +185,7 @@ func (h *Handler) dialWebSocket(ctx context.Context, target *url.URL, headers ht
 
 func dialWebSocketConn(ctx context.Context, target *url.URL) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: webSocketDialTimeout, KeepAlive: 30 * time.Second}
-	addr := target.Host
-	if !strings.Contains(addr, ":") {
-		addr += ":" + defaultWebSocketPort(target.Scheme)
-	}
+	addr := webSocketDialAddr(target)
 	switch strings.ToLower(target.Scheme) {
 	case "https", "wss":
 		rawConn, err := dialer.DialContext(ctx, "tcp", addr)
@@ -210,6 +207,17 @@ func dialWebSocketConn(ctx context.Context, target *url.URL) (net.Conn, error) {
 	default:
 		return nil, fmt.Errorf("unsupported websocket target scheme: %s", target.Scheme)
 	}
+}
+
+// webSocketDialAddr builds the "host:port" address to dial. The port may be
+// absent from the target, and a bare IPv6 literal such as "[::1]" already
+// carries colons of its own, so the port can only be told apart by splitting
+// the host properly rather than by looking for a colon.
+func webSocketDialAddr(target *url.URL) string {
+	if host, port, err := net.SplitHostPort(target.Host); err == nil && port != "" {
+		return net.JoinHostPort(host, port)
+	}
+	return net.JoinHostPort(target.Hostname(), defaultWebSocketPort(target.Scheme))
 }
 
 func webSocketHandshakeDeadline(ctx context.Context) time.Time {
