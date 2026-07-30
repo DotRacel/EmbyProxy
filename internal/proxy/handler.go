@@ -331,7 +331,10 @@ func (h *Handler) ResetNodeRoutingState(uid, name string) {
 
 func (h *Handler) parseRequest(r *http.Request) (parsedRoute, int, string) {
 	segments := []string{}
-	trimmed := strings.Trim(r.URL.Path, "/")
+	// Split before decoding: r.URL.Path is already decoded, so unescaping it a
+	// second time would corrupt literal percent signs and let an encoded %2F pass
+	// as a path separator.
+	trimmed := strings.Trim(r.URL.EscapedPath(), "/")
 	if trimmed != "" {
 		for _, part := range strings.Split(trimmed, "/") {
 			decoded, err := url.PathUnescape(part)
