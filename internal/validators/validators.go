@@ -51,7 +51,6 @@ func ValidateNodeInput(input map[string]any) Result {
 	if errText != "" {
 		return Result{Error: errText}
 	}
-	rank := optionalInt(input["rank"])
 	hasImpersonate := hasKey(input, "impersonate")
 	keepaliveMaxPerDay := 1
 	if valuePresent(input["keepaliveMaxPerDay"]) {
@@ -77,7 +76,6 @@ func ValidateNodeInput(input map[string]any) Result {
 		Name:                name,
 		Target:              target,
 		Fav:                 ToBool(input["fav"]),
-		Rank:                rank,
 		Secret:              secret,
 		Tag:                 truncate(strings.TrimSpace(asString(input["tag"])), 64),
 		DisplayName:         truncate(regexp.MustCompile(`\s+`).ReplaceAllString(strings.TrimSpace(asString(input["displayName"])), " "), 32),
@@ -201,14 +199,6 @@ func normalizeFullWidthDigits(value string) string {
 		}
 		return r
 	}, value)
-}
-
-func optionalInt(value any) *int {
-	if !valuePresent(value) {
-		return nil
-	}
-	n := intValue(value)
-	return &n
 }
 
 func intValue(value any) int {

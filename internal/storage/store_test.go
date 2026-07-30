@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -161,5 +162,48 @@ func TestTGConfigKeepsExplicitReportDisabled(t *testing.T) {
 	}
 	if got.ReportEnabled {
 		t.Fatalf("ReportEnabled = true, want false")
+	}
+}
+
+// 手动排序移除后，老数据里残留的 "r" 键必须被静默忽略（节点整条打包成 JSON 存在
+// proxy_kv 里，没有列要删），并且下一次保存时自然从存量里消失。
+func TestUnpackNodeIgnoresLegacyRankKey(t *testing.T) {
+	node, ok := UnpackNode("alpha", `{"t":"http://a","r":7,"f":1}`)
+	if !ok {
+		t.Fatalf("UnpackNode 失败")
+	}
+	if node.Target != "http://a" || !node.Fav {
+		t.Fatalf("老数据其余字段应保持不变: %+v", node)
+	}
+	packed, err := PackNode(node)
+	if err != nil {
+		t.Fatalf("PackNode: %v", err)
+	}
+	if strings.Contains(packed, `"r"`) {
+		t.Fatalf("重新打包后不应再写入 rank: %s", packed)
+	}
+}
+
+// 去掉 Rank 之后的兜底顺序：收藏优先，其余按名称升序，反复排序结果必须一致。
+func TestSortNodesFavoritesFirstThenName(t *testing.T) {
+	nodes := []Node{
+		{Name: "delta"},
+		{Name: "alpha"},
+		{Name: "zeta", Fav: true},
+		{Name: "beta", Fav: true},
+		{Name: "charlie"},
+	}
+	SortNodes(nodes)
+	want := []string{"beta", "zeta", "alpha", "charlie", "delta"}
+	for i, name := range want {
+		if nodes[i].Name != name {
+			t.Fatalf("第 %d 个节点应为 %s，实际 %s（完整顺序 %+v）", i, name, nodes[i].Name, nodes)
+		}
+	}
+	SortNodes(nodes)
+	for i, name := range want {
+		if nodes[i].Name != name {
+			t.Fatalf("再次排序后顺序发生变化: %+v", nodes)
+		}
 	}
 }

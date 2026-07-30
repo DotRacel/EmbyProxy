@@ -15,7 +15,6 @@ type Node struct {
 	Name                string `json:"name"`
 	Target              string `json:"target"`
 	Fav                 bool   `json:"fav"`
-	Rank                *int   `json:"rank,omitempty"`
 	Secret              string `json:"secret"`
 	Tag                 string `json:"tag"`
 	DisplayName         string `json:"displayName"`
@@ -176,7 +175,6 @@ type HostMatch struct {
 type packedNode struct {
 	Target              string `json:"t,omitempty"`
 	Fav                 int    `json:"f,omitempty"`
-	Rank                *int   `json:"r,omitempty"`
 	Secret              string `json:"s,omitempty"`
 	Tag                 string `json:"g,omitempty"`
 	DisplayName         string `json:"d,omitempty"`
@@ -193,7 +191,6 @@ type packedNode struct {
 func PackNode(node Node) (string, error) {
 	p := packedNode{
 		Target:             node.Target,
-		Rank:               node.Rank,
 		Secret:             node.Secret,
 		Tag:                node.Tag,
 		DisplayName:        node.DisplayName,
@@ -235,7 +232,6 @@ func UnpackNode(name, packed string) (Node, bool) {
 		Name:                name,
 		Target:              p.Target,
 		Fav:                 p.Fav != 0,
-		Rank:                p.Rank,
 		Secret:              p.Secret,
 		Tag:                 p.Tag,
 		DisplayName:         p.DisplayName,
@@ -266,20 +262,13 @@ func SplitTargets(value string) []string {
 	return out
 }
 
+// SortNodes 把收藏项排在前面，其余按节点名升序。手动排序（Rank）已移除，
+// 名称是唯一的，因此这里的顺序完全由数据决定，刷新前后不会跳。
 func SortNodes(nodes []Node) {
 	sort.SliceStable(nodes, func(i, j int) bool {
 		a, b := nodes[i], nodes[j]
 		if a.Fav != b.Fav {
 			return a.Fav
-		}
-		if a.Rank != nil && b.Rank != nil {
-			return *a.Rank < *b.Rank
-		}
-		if a.Rank != nil {
-			return true
-		}
-		if b.Rank != nil {
-			return false
 		}
 		return strings.Compare(a.Name, b.Name) < 0
 	})

@@ -965,3 +965,26 @@ func TestConfigSetImageCacheMaxMB(t *testing.T) {
 		})
 	}
 }
+
+// 旧版导出的 JSON 里带 rank（手动排序），字段移除后导入不能因此报错，
+// 该键被直接忽略即可。
+func TestImportAcceptsLegacyRankField(t *testing.T) {
+	handler, cleanup := newConfigTestHandler(t)
+	defer cleanup()
+	ctx := context.Background()
+	res, status := handler.dispatch(ctx, "admin", "import", map[string]any{
+		"nodes": []any{
+			map[string]any{"name": "legacy", "target": "http://127.0.0.1:9901", "rank": float64(3)},
+		},
+	})
+	if status != http.StatusOK || res["ok"] != true {
+		t.Fatalf("import 旧导出失败 status=%d res=%+v", status, res)
+	}
+	node, err := handler.store.GetNode(ctx, "admin", "legacy")
+	if err != nil || node == nil {
+		t.Fatalf("GetNode() node=%+v err=%v", node, err)
+	}
+	if node.Target != "http://127.0.0.1:9901" {
+		t.Fatalf("target = %q", node.Target)
+	}
+}
