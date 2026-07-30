@@ -11,9 +11,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"embyproxy/internal/config"
@@ -25,6 +27,12 @@ const (
 	imageCacheTTLDaysLimit      = 365
 	imageCacheMetaCacheTTL      = time.Minute
 	imageCacheMetaCacheMaxItems = 4096
+	// 容量淘汰的低水位：超过上限后一直淘汰到上限的 90%，
+	// 避免刚好卡在上限上、每写一张图就触发一次淘汰。
+	imageCacheEvictLowWaterPct = 90
+	// 启动扫描时，body/meta 只剩其一的残缺条目要老于这个时间才删，
+	// 免得误删正在写入（body 已 rename、meta 还没落盘）的条目。
+	imageCacheOrphanGrace = time.Hour
 )
 
 var imageCacheIgnoredQueryParams = map[string]bool{
@@ -50,6 +58,7 @@ var imageCacheIgnoredQueryParams = map[string]bool{
 type imageDiskCache struct {
 	dir         string
 	ttl         time.Duration
+	maxBytes    int64
 	now         func() time.Time
 	cleanupMu   sync.Mutex
 	lastCleanup time.Time
@@ -57,14 +66,32 @@ type imageDiskCache struct {
 	fills       map[string]*imageCacheFill
 	metaMu      sync.RWMutex
 	metaCache   map[string]imageMetaCacheEntry
+	// 容量淘汰用的内存索引：hash -> 占用字节 + 最近访问时间。
+	// 命中时只改内存里的时间戳，热路径上不做任何额外磁盘 IO。
+	indexMu    sync.Mutex
+	index      map[string]*imageCacheIndexEntry
+	indexBytes int64
+	indexReady bool
+	indexGen   uint64
+	scanOnce   sync.Once
+	scanDone   chan struct{}
+	evicting   atomic.Bool
+}
+
+type imageCacheIndexEntry struct {
+	size       int64
+	lastAccess int64 // UnixNano
 }
 
 type ImageCacheStats struct {
-	Enabled bool   `json:"enabled"`
-	Dir     string `json:"dir"`
-	Bytes   int64  `json:"bytes"`
-	Files   int    `json:"files"`
-	Entries int    `json:"entries"`
+	Enabled    bool    `json:"enabled"`
+	Dir        string  `json:"dir"`
+	Bytes      int64   `json:"bytes"`
+	Files      int     `json:"files"`
+	Entries    int     `json:"entries"`
+	MaxBytes   int64   `json:"maxBytes"`
+	Usage      float64 `json:"usage"`
+	IndexReady bool    `json:"indexReady"`
 }
 
 type imageCacheMeta struct {
@@ -97,7 +124,9 @@ func newImageCacheFromSystemConfig(cfg config.Config, sys storage.SystemConfig) 
 	if !sys.ImageCacheEnabled {
 		return nil
 	}
-	return newImageDiskCache(imageCacheDir(cfg), imageCacheTTL(sys))
+	cache := newImageDiskCache(imageCacheDir(cfg), imageCacheTTL(sys), sys.ImageCacheMaxBytes())
+	cache.startIndexScan()
+	return cache
 }
 
 func (h *Handler) ensureImageCache(ctx context.Context) *imageDiskCache {
@@ -110,13 +139,15 @@ func (h *Handler) ensureImageCache(ctx context.Context) *imageDiskCache {
 	}
 	dir := imageCacheDir(h.cfg)
 	ttl := imageCacheTTL(sys)
+	maxBytes := sys.ImageCacheMaxBytes()
 	h.imageCacheMu.Lock()
-	defer h.imageCacheMu.Unlock()
 	cache := h.imageCache
-	if cache == nil || !cache.matches(dir, ttl) {
-		cache = newImageDiskCache(dir, ttl)
+	if cache == nil || !cache.matches(dir, ttl, maxBytes) {
+		cache = newImageDiskCache(dir, ttl, maxBytes)
 		h.imageCache = cache
 	}
+	h.imageCacheMu.Unlock()
+	cache.startIndexScan()
 	return cache
 }
 
@@ -134,16 +165,31 @@ func imageCacheTTL(sys storage.SystemConfig) time.Duration {
 	return time.Duration(days) * 24 * time.Hour
 }
 
-func newImageDiskCache(dir string, ttl time.Duration) *imageDiskCache {
+// newImageDiskCache 创建缓存实例。maxBytes<=0 表示不限制容量，
+// 此时索引、扫描、淘汰全部关闭，行为与加容量上限之前完全一致。
+func newImageDiskCache(dir string, ttl time.Duration, maxBytes int64) *imageDiskCache {
 	dir = strings.TrimSpace(dir)
 	if dir == "" || ttl <= 0 {
 		return nil
 	}
-	return &imageDiskCache{dir: dir, ttl: ttl, now: time.Now}
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	return &imageDiskCache{
+		dir:      dir,
+		ttl:      ttl,
+		maxBytes: maxBytes,
+		now:      time.Now,
+		index:    map[string]*imageCacheIndexEntry{},
+		scanDone: make(chan struct{}),
+	}
 }
 
-func (c *imageDiskCache) matches(dir string, ttl time.Duration) bool {
-	return c != nil && c.dir == strings.TrimSpace(dir) && c.ttl == ttl
+func (c *imageDiskCache) matches(dir string, ttl time.Duration, maxBytes int64) bool {
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	return c != nil && c.dir == strings.TrimSpace(dir) && c.ttl == ttl && c.maxBytes == maxBytes
 }
 
 func imageCacheKey(nodeName string, target *url.URL) string {
@@ -179,6 +225,8 @@ func (c *imageDiskCache) get(r *http.Request, key string, reqOrigin string, env 
 		c.remove(paths)
 		return nil, false
 	}
+	// LRU：命中只更新内存里的访问时间，不落盘、不 Chtimes、不 fsync。
+	c.indexTouch(paths.hash)
 
 	headers := cloneHeader(meta.Header)
 	addCORSHeaders(headers, reqOrigin, env)
@@ -289,7 +337,9 @@ func (c *imageDiskCache) CleanupExpired() {
 			body := strings.TrimSuffix(path, ".json") + ".body"
 			_ = os.Remove(path)
 			_ = os.Remove(body)
-			c.deleteCachedMeta(strings.TrimSuffix(d.Name(), ".json"))
+			hash := strings.TrimSuffix(d.Name(), ".json")
+			c.deleteCachedMeta(hash)
+			c.indexDelete(hash)
 		}
 		return nil
 	})
@@ -340,7 +390,7 @@ func (h *Handler) imageCacheForOps(ctx context.Context) (*imageDiskCache, bool, 
 	if cache != nil {
 		cache.clearCachedMeta()
 	}
-	return newImageDiskCache(dir, ttl), false, dir
+	return newImageDiskCache(dir, ttl, sys.ImageCacheMaxBytes()), false, dir
 }
 
 func (c *imageDiskCache) Stats(enabled bool) (ImageCacheStats, error) {
@@ -349,6 +399,8 @@ func (c *imageDiskCache) Stats(enabled bool) (ImageCacheStats, error) {
 		return stats, nil
 	}
 	stats.Dir = c.dir
+	stats.MaxBytes = c.maxBytes
+	_, stats.IndexReady = c.indexUsage()
 	c.cleanupMu.Lock()
 	defer c.cleanupMu.Unlock()
 	err := filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
@@ -369,6 +421,9 @@ func (c *imageDiskCache) Stats(enabled bool) (ImageCacheStats, error) {
 		}
 		return nil
 	})
+	if stats.MaxBytes > 0 {
+		stats.Usage = float64(stats.Bytes) / float64(stats.MaxBytes)
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		return stats, nil
 	}
@@ -384,6 +439,7 @@ func (c *imageDiskCache) Clear() error {
 	entries, err := os.ReadDir(c.dir)
 	if errors.Is(err, os.ErrNotExist) {
 		c.clearCachedMeta()
+		c.indexReset()
 		c.lastCleanup = time.Time{}
 		return nil
 	}
@@ -397,8 +453,259 @@ func (c *imageDiskCache) Clear() error {
 		}
 	}
 	c.clearCachedMeta()
+	c.indexReset()
 	c.lastCleanup = time.Time{}
 	return firstErr
+}
+
+// ---------- 容量上限 + LRU 淘汰 ----------
+//
+// 索引全在内存里：hash -> {占用字节, 最近访问时间}。缓存命中时只写内存时间戳，
+// 热路径不产生任何额外磁盘 IO；索引本身可丢，丢了重扫目录即可。
+
+// startIndexScan 在后台重建索引，不阻塞启动。扫完之前不做任何淘汰，
+// 避免索引不全时误删还热着的条目。
+func (c *imageDiskCache) startIndexScan() {
+	if c == nil || c.maxBytes <= 0 {
+		return
+	}
+	c.scanOnce.Do(func() {
+		go func() {
+			c.scanIndex()
+			close(c.scanDone)
+		}()
+	})
+}
+
+// scanIndex 扫描缓存目录重建索引。lastAccess 用文件 mtime 兜底
+// （不依赖 atime：容器挂载普遍是 relatime/noatime）。
+func (c *imageDiskCache) scanIndex() {
+	if c == nil || c.maxBytes <= 0 {
+		return
+	}
+	c.indexMu.Lock()
+	gen := c.indexGen
+	c.indexMu.Unlock()
+
+	type scannedEntry struct {
+		size    int64
+		modTime int64
+		hasBody bool
+		hasMeta bool
+	}
+	found := map[string]*scannedEntry{}
+	_ = filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		isBody := strings.HasSuffix(name, ".body")
+		if !isBody && !strings.HasSuffix(name, ".json") {
+			return nil // .tmp 之类交给 CleanupExpired
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return nil
+		}
+		hash := strings.TrimSuffix(strings.TrimSuffix(name, ".body"), ".json")
+		entry := found[hash]
+		if entry == nil {
+			entry = &scannedEntry{}
+			found[hash] = entry
+		}
+		entry.size += info.Size()
+		if mod := info.ModTime().UnixNano(); mod > entry.modTime {
+			entry.modTime = mod
+		}
+		if isBody {
+			entry.hasBody = true
+		} else {
+			entry.hasMeta = true
+		}
+		return nil
+	})
+
+	now := c.now()
+	for hash, entry := range found {
+		if entry.hasBody && entry.hasMeta {
+			continue
+		}
+		// 残缺条目（只剩 body 或只剩 meta）永远命不中：老于宽限期直接删；
+		// 还很新的可能是正在写入的条目，先留着并计入占用，下次扫描再说。
+		if now.Sub(time.Unix(0, entry.modTime)) > imageCacheOrphanGrace {
+			c.remove(c.pathsForHash(hash))
+			delete(found, hash)
+		}
+	}
+
+	c.indexMu.Lock()
+	if c.indexGen != gen {
+		c.indexMu.Unlock() // 扫描期间缓存被清空，本次结果作废
+		return
+	}
+	for hash, entry := range found {
+		existing := c.index[hash]
+		if existing == nil {
+			c.index[hash] = &imageCacheIndexEntry{size: entry.size, lastAccess: entry.modTime}
+			c.indexBytes += entry.size
+			continue
+		}
+		// 扫描期间被写入或命中过的条目：访问时间以内存里的为准，只补体积。
+		if existing.size == 0 {
+			existing.size = entry.size
+			c.indexBytes += entry.size
+		}
+		if entry.modTime > existing.lastAccess {
+			existing.lastAccess = entry.modTime
+		}
+	}
+	c.indexReady = true
+	c.indexMu.Unlock()
+	c.evictOverflow()
+}
+
+func (c *imageDiskCache) indexTouch(hash string) {
+	if c == nil || c.maxBytes <= 0 || hash == "" {
+		return
+	}
+	now := c.now().UnixNano()
+	c.indexMu.Lock()
+	if entry := c.index[hash]; entry != nil {
+		entry.lastAccess = now
+	} else if !c.indexReady {
+		// 索引还没建好就命中：先把访问时间记下来，体积等扫描补齐，
+		// 免得刚被访问过的条目扫描完就因为 mtime 很旧而被淘汰。
+		c.index[hash] = &imageCacheIndexEntry{lastAccess: now}
+	}
+	c.indexMu.Unlock()
+}
+
+func (c *imageDiskCache) indexPut(hash string, size int64) {
+	if c == nil || c.maxBytes <= 0 || hash == "" || size <= 0 {
+		return
+	}
+	now := c.now().UnixNano()
+	c.indexMu.Lock()
+	if entry := c.index[hash]; entry != nil {
+		c.indexBytes += size - entry.size
+		entry.size = size
+		entry.lastAccess = now
+	} else {
+		c.index[hash] = &imageCacheIndexEntry{size: size, lastAccess: now}
+		c.indexBytes += size
+	}
+	c.indexMu.Unlock()
+}
+
+func (c *imageDiskCache) indexDelete(hash string) {
+	if c == nil || c.maxBytes <= 0 || hash == "" {
+		return
+	}
+	c.indexMu.Lock()
+	if entry := c.index[hash]; entry != nil {
+		c.indexBytes -= entry.size
+		if c.indexBytes < 0 {
+			c.indexBytes = 0
+		}
+		delete(c.index, hash)
+	}
+	c.indexMu.Unlock()
+}
+
+func (c *imageDiskCache) indexReset() {
+	if c == nil {
+		return
+	}
+	c.indexMu.Lock()
+	c.indexGen++
+	c.index = map[string]*imageCacheIndexEntry{}
+	c.indexBytes = 0
+	c.indexMu.Unlock()
+}
+
+// maybeEvict 只在确实超上限时才启动一次后台淘汰，写入路径上不等待。
+func (c *imageDiskCache) maybeEvict() {
+	if c == nil || c.maxBytes <= 0 {
+		return
+	}
+	c.indexMu.Lock()
+	over := c.indexReady && c.indexBytes > c.maxBytes
+	c.indexMu.Unlock()
+	if !over || !c.evicting.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		for {
+			c.evictOverflow()
+			c.evicting.Store(false)
+			// 让出标志位后再确认一次：淘汰期间到达的写入会被 CAS 挡掉，
+			// 不复查的话就会一直停在上限之上。
+			c.indexMu.Lock()
+			again := c.indexReady && c.indexBytes > c.maxBytes
+			c.indexMu.Unlock()
+			if !again || !c.evicting.CompareAndSwap(false, true) {
+				return
+			}
+		}
+	}()
+}
+
+// evictOverflow 按 lastAccess 从旧到新淘汰，一直淘汰到低水位（上限的 90%）。
+// 选victim 在锁内完成，实际删文件放到锁外，不让淘汰阻塞读写。
+func (c *imageDiskCache) evictOverflow() {
+	if c == nil || c.maxBytes <= 0 {
+		return
+	}
+	target := c.maxBytes * imageCacheEvictLowWaterPct / 100
+	c.indexMu.Lock()
+	if !c.indexReady || c.indexBytes <= c.maxBytes {
+		c.indexMu.Unlock()
+		return
+	}
+	type candidate struct {
+		hash       string
+		lastAccess int64
+	}
+	candidates := make([]candidate, 0, len(c.index))
+	for hash, entry := range c.index {
+		candidates = append(candidates, candidate{hash: hash, lastAccess: entry.lastAccess})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].lastAccess != candidates[j].lastAccess {
+			return candidates[i].lastAccess < candidates[j].lastAccess
+		}
+		return candidates[i].hash < candidates[j].hash
+	})
+	victims := make([]string, 0, 16)
+	for _, cand := range candidates {
+		if c.indexBytes <= target {
+			break
+		}
+		entry := c.index[cand.hash]
+		if entry == nil {
+			continue
+		}
+		c.indexBytes -= entry.size
+		if c.indexBytes < 0 {
+			c.indexBytes = 0
+		}
+		delete(c.index, cand.hash)
+		victims = append(victims, cand.hash)
+	}
+	c.indexMu.Unlock()
+
+	for _, hash := range victims {
+		c.remove(c.pathsForHash(hash))
+	}
+}
+
+func (c *imageDiskCache) indexUsage() (bytes int64, ready bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.indexMu.Lock()
+	defer c.indexMu.Unlock()
+	return c.indexBytes, c.indexReady
 }
 
 func (c *imageDiskCache) readMeta(paths imageCachePaths, key string) (imageCacheMeta, bool) {
@@ -454,6 +761,7 @@ func (c *imageDiskCache) remove(paths imageCachePaths) {
 	_ = os.Remove(paths.meta)
 	_ = os.Remove(paths.body)
 	c.deleteCachedMeta(paths.hash)
+	c.indexDelete(paths.hash)
 }
 
 func (c *imageDiskCache) cachedBodyExists(paths imageCachePaths) bool {
@@ -583,6 +891,7 @@ type imageCacheWriteCloser struct {
 	onDone   func()
 	done     bool
 	failed   bool
+	written  int64
 }
 
 func (w *imageCacheWriteCloser) Read(p []byte) (int, error) {
@@ -590,6 +899,8 @@ func (w *imageCacheWriteCloser) Read(p []byte) (int, error) {
 	if n > 0 && !w.failed {
 		if _, writeErr := w.file.Write(p[:n]); writeErr != nil {
 			w.failed = true
+		} else {
+			w.written += int64(n)
 		}
 	}
 	if err == io.EOF {
@@ -641,6 +952,8 @@ func (w *imageCacheWriteCloser) commit() {
 	}
 	if w.cache != nil {
 		w.cache.setCachedMeta(w.keyHash, w.meta, w.cache.now())
+		w.cache.indexPut(w.keyHash, w.written+int64(len(data)))
+		w.cache.maybeEvict()
 	}
 }
 
