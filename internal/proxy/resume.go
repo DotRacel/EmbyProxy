@@ -26,6 +26,55 @@ const (
 	streamResumeDrainLimit    = 256 * 1024
 )
 
+// streamResumeRetryBackoff spaces out retries of the resume request itself. A
+// resume that fails at the transport level usually means the upstream (or the
+// path to it) needs a moment, and hammering it without a pause just burns the
+// budget in microseconds. It is a var so tests can shrink it.
+var streamResumeRetryBackoff = 500 * time.Millisecond
+
+// transientStreamResumeError marks a resume failure that says nothing about
+// whether the upstream can still serve the remaining range: a dial/read error
+// on the resume request, or a status the upstream may well answer differently a
+// moment later. Retrying those inside the existing budget keeps a single DNS
+// blip from killing a multi-hour playback. Every other failure is permanent,
+// because it means resuming would either be rejected again or splice bytes from
+// a different representation into the client's stream.
+type transientStreamResumeError struct {
+	err error
+}
+
+func (e *transientStreamResumeError) Error() string { return e.err.Error() }
+
+func (e *transientStreamResumeError) Unwrap() error { return e.err }
+
+func transientStreamResume(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &transientStreamResumeError{err: err}
+}
+
+func isTransientStreamResumeError(err error) bool {
+	var transient *transientStreamResumeError
+	return errors.As(err, &transient)
+}
+
+// streamResumeTransientStatus reports whether an unexpected resume status may
+// be momentary. 5xx (plus the two explicit "come back later" codes) can clear
+// on the next try; anything else - notably a 200, which means the upstream
+// ignored If-Range because the validator no longer matches - would corrupt the
+// byte stream or fail identically forever.
+func streamResumeTransientStatus(status int) bool {
+	switch {
+	case status >= 500 && status <= 599:
+		return true
+	case status == http.StatusRequestTimeout, status == http.StatusTooManyRequests:
+		return true
+	default:
+		return false
+	}
+}
+
 type upstreamClientContextKey struct{}
 type streamResumeSourceContextKey struct{}
 
@@ -250,7 +299,7 @@ func (h *Handler) copyResponseBodyWithResume(w http.ResponseWriter, r *http.Requ
 		}
 		progress.attempts++
 		progress.consecutive++
-		nextResp, err := h.resumeStreamResponse(current, plan, nextStart)
+		nextResp, err := h.resumeStreamWithinBudget(r, current, plan, nextStart, &progress)
 		drainAndCloseResponseBody(current)
 		if err != nil {
 			progress.err = err
@@ -271,6 +320,53 @@ func (h *Handler) copyResponseBodyWithResume(w http.ResponseWriter, r *http.Requ
 	return stats, nil
 }
 
+// resumeStreamWithinBudget retries the resume request itself while the budget
+// allows. The read error that triggered the resume already cost one attempt, so
+// a retry is charged as a new attempt: transient resume failures compete for the
+// very same consecutive/total budget as fruitless resumes, and the loop can
+// never spin without moving that budget forward.
+func (h *Handler) resumeStreamWithinBudget(r *http.Request, current *http.Response, plan streamResumePlan, nextStart int64, progress *streamResumeProgress) (*http.Response, error) {
+	for {
+		nextResp, err := h.resumeStreamResponse(current, plan, nextStart)
+		if err == nil {
+			return nextResp, nil
+		}
+		if !isTransientStreamResumeError(err) {
+			return nil, err
+		}
+		if progress.exhausted() {
+			return nil, fmt.Errorf("stream resume attempts exhausted: %w", err)
+		}
+		// A client that has already walked away must not be kept waiting on an
+		// upstream nobody is reading from any more.
+		if waitErr := waitStreamResumeBackoff(r); waitErr != nil {
+			return nil, err
+		}
+		progress.attempts++
+		progress.consecutive++
+	}
+}
+
+// waitStreamResumeBackoff pauses between resume retries, returning early with
+// the context error as soon as the downstream request is cancelled.
+func waitStreamResumeBackoff(r *http.Request) error {
+	ctx := context.Background()
+	if r != nil {
+		ctx = r.Context()
+	}
+	if streamResumeRetryBackoff <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(streamResumeRetryBackoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func (h *Handler) resumeStreamResponse(current *http.Response, plan streamResumePlan, nextStart int64) (*http.Response, error) {
 	client := upstreamClientForResponse(current)
 	if client == nil {
@@ -282,7 +378,9 @@ func (h *Handler) resumeStreamResponse(current *http.Response, plan streamResume
 	}
 	nextResp, err := client.Do(nextReq)
 	if err != nil {
-		return nil, err
+		// Dial failures, connection resets and handshake timeouts describe the
+		// moment, not the resource: they are worth another try inside budget.
+		return nil, transientStreamResume(err)
 	}
 	attachUpstreamClient(nextResp, client)
 	markStreamResumeCandidate(nextResp, streamResumeSource(current))
@@ -339,7 +437,11 @@ func validateStreamResumeResponse(resp *http.Response, plan streamResumePlan, ne
 		return errors.New("stream resume response missing")
 	}
 	if resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("stream resume unexpected status %d", resp.StatusCode)
+		err := fmt.Errorf("stream resume unexpected status %d", resp.StatusCode)
+		if streamResumeTransientStatus(resp.StatusCode) {
+			return transientStreamResume(err)
+		}
+		return err
 	}
 	if resp.Uncompressed || strings.TrimSpace(resp.Header.Get("Content-Encoding")) != "" {
 		return errors.New("stream resume response was decoded")
