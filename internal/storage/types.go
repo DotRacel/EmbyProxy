@@ -134,7 +134,9 @@ func (c SystemConfig) ImageCacheMaxBytes() int64 {
 	if mb > MaxImageCacheMaxMB {
 		mb = MaxImageCacheMaxMB
 	}
-	return int64(mb) << 20
+	// 用十进制 MB 而不是 MiB：面板上所有字节数都由前端的 formatBytes 按 1e6 换算显示，
+	// 这里若用 1<<20，填 512 会显示成 536.9 MB，两套进制对不上。
+	return int64(mb) * 1_000_000
 }
 
 type PlayStat struct {

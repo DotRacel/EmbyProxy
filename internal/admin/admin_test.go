@@ -956,7 +956,9 @@ func TestConfigSetImageCacheMaxMB(t *testing.T) {
 			if got.ImageCacheMaxMB != tt.want {
 				t.Fatalf("ImageCacheMaxMB = %d, want %d", got.ImageCacheMaxMB, tt.want)
 			}
-			wantBytes := int64(tt.want) << 20
+			// 十进制 MB（1e6），与面板上 formatBytes 的换算保持一致；
+			// 用 MiB 的话填 512 会显示成 536.9 MB，两套进制对不上。
+			wantBytes := int64(tt.want) * 1_000_000
 			if got.ImageCacheMaxBytes() != wantBytes {
 				t.Fatalf("ImageCacheMaxBytes() = %d, want %d", got.ImageCacheMaxBytes(), wantBytes)
 			}
