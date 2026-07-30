@@ -76,6 +76,12 @@ type imageDiskCache struct {
 	scanOnce   sync.Once
 	scanDone   chan struct{}
 	evicting   atomic.Bool
+	// 命中率统计：纯内存原子计数器，热路径上不加锁、不落盘、不碰数据库。
+	// 统计口径是「本缓存实例创建以来」，进程重启、配置变更导致实例重建、
+	// 手动清空缓存都会归零，statsSince 记录本轮统计的起点（Unix 秒）。
+	hits       atomic.Int64
+	misses     atomic.Int64
+	statsSince atomic.Int64
 }
 
 type imageCacheIndexEntry struct {
@@ -92,6 +98,14 @@ type ImageCacheStats struct {
 	MaxBytes   int64   `json:"maxBytes"`
 	Usage      float64 `json:"usage"`
 	IndexReady bool    `json:"indexReady"`
+	// Hits/Misses 只统计真正查过缓存的图片请求；Lookups = Hits + Misses，
+	// 为 0 表示本轮还没有样本（此时 HitRate 固定为 0，不会是 NaN）。
+	// StatsSince 是本轮统计的起始时间（Unix 秒，0 表示没有统计）。
+	Hits       int64   `json:"hits"`
+	Misses     int64   `json:"misses"`
+	Lookups    int64   `json:"lookups"`
+	HitRate    float64 `json:"hitRate"`
+	StatsSince int64   `json:"statsSince"`
 }
 
 type imageCacheMeta struct {
@@ -175,7 +189,7 @@ func newImageDiskCache(dir string, ttl time.Duration, maxBytes int64) *imageDisk
 	if maxBytes < 0 {
 		maxBytes = 0
 	}
-	return &imageDiskCache{
+	cache := &imageDiskCache{
 		dir:      dir,
 		ttl:      ttl,
 		maxBytes: maxBytes,
@@ -183,6 +197,8 @@ func newImageDiskCache(dir string, ttl time.Duration, maxBytes int64) *imageDisk
 		index:    map[string]*imageCacheIndexEntry{},
 		scanDone: make(chan struct{}),
 	}
+	cache.statsSince.Store(time.Now().Unix())
+	return cache
 }
 
 func (c *imageDiskCache) matches(dir string, ttl time.Duration, maxBytes int64) bool {
@@ -212,10 +228,22 @@ func imageCacheKeyHash(key string) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
-func (c *imageDiskCache) get(r *http.Request, key string, reqOrigin string, env config.ProxyEnv) (*http.Response, bool) {
+// get 查缓存，同时按「一个请求一次」记命中率：
+//   - 缓存未启用（c==nil）、非 GET/HEAD、带 Range 的请求根本不进统计，
+//     免得把分母稀释成没有意义的数字；
+//   - 条目新鲜且能取到 body（含返回 304 的情况）算命中；
+//   - 条目不存在、TTL 过期、只剩 meta 或只剩 body 的残缺条目算未命中。
+func (c *imageDiskCache) get(r *http.Request, key string, reqOrigin string, env config.ProxyEnv) (res *http.Response, hit bool) {
 	if c == nil || key == "" || r == nil || !imageCacheLookupMethod(r.Method) || r.Header.Get("Range") != "" {
 		return nil, false
 	}
+	defer func() {
+		if hit {
+			c.hits.Add(1)
+		} else {
+			c.misses.Add(1)
+		}
+	}()
 	paths := c.paths(key)
 	meta, ok := c.readMeta(paths, key)
 	if !ok {
@@ -424,12 +452,60 @@ func (c *imageDiskCache) Stats(enabled bool) (ImageCacheStats, error) {
 	if stats.MaxBytes > 0 {
 		stats.Usage = float64(stats.Bytes) / float64(stats.MaxBytes)
 	}
+	// 缓存关闭时拿到的是临时实例，命中率没有统计口径可言，一律留空（lookups=0）。
+	if enabled {
+		c.fillHitStats(&stats)
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		return stats, nil
 	}
 	return stats, err
 }
 
+// fillHitStats 把命中率计数器填进统计结果。分母为 0 时命中率固定为 0，
+// 不会产生 NaN（NaN 连 json.Marshal 都过不去），前端用 lookups==0 判断「暂无数据」。
+func (c *imageDiskCache) fillHitStats(stats *ImageCacheStats) {
+	if c == nil || stats == nil {
+		return
+	}
+	stats.Hits = c.hits.Load()
+	stats.Misses = c.misses.Load()
+	stats.Lookups = stats.Hits + stats.Misses
+	if stats.Lookups > 0 {
+		stats.HitRate = float64(stats.Hits) / float64(stats.Lookups)
+	}
+	stats.StatsSince = c.statsSince.Load()
+}
+
+// resetStats 归零命中率计数器，并把统计起点推到当前时刻。
+func (c *imageDiskCache) resetStats() {
+	if c == nil {
+		return
+	}
+	c.hits.Store(0)
+	c.misses.Store(0)
+	c.statsSince.Store(c.now().Unix())
+}
+
+// rollbackMiss 撤回一次未命中，且不会把计数器减成负数。
+func (c *imageDiskCache) rollbackMiss() {
+	if c == nil {
+		return
+	}
+	for {
+		cur := c.misses.Load()
+		if cur <= 0 {
+			return
+		}
+		if c.misses.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
+// Clear 清空缓存时一并重置命中率计数器：缓存已经空了，
+// 清空前那段命中率描述的是一个不复存在的缓存状态，留着只会误导；
+// 重置后 statsSince 指向清空时刻，前端能明确说出统计窗口。
 func (c *imageDiskCache) Clear() error {
 	if c == nil {
 		return nil
@@ -440,6 +516,7 @@ func (c *imageDiskCache) Clear() error {
 	if errors.Is(err, os.ErrNotExist) {
 		c.clearCachedMeta()
 		c.indexReset()
+		c.resetStats()
 		c.lastCleanup = time.Time{}
 		return nil
 	}
@@ -454,6 +531,7 @@ func (c *imageDiskCache) Clear() error {
 	}
 	c.clearCachedMeta()
 	c.indexReset()
+	c.resetStats()
 	c.lastCleanup = time.Time{}
 	return firstErr
 }
@@ -791,6 +869,10 @@ func (c *imageDiskCache) waitFill(ctx context.Context, fill *imageCacheFill) err
 	if fill == nil {
 		return nil
 	}
+	// 合并回源：本请求刚才那次查询已经记了一次未命中，但它等的是别人正在回源的同一张图，
+	// 等完还会再查一次缓存。这里把那次未命中撤回，让一个请求只落一次命中/未命中，
+	// 否则被合并的请求会同时贡献一次未命中和一次命中，把命中率算歪。
+	c.rollbackMiss()
 	select {
 	case <-fill.done:
 		return nil
