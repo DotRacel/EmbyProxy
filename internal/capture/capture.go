@@ -782,8 +782,17 @@ func ReadJSONL(path string) ([]Record, error) {
 }
 
 func DrainAndRemember(req *http.Request, max int64) ([]byte, error) {
+	body, _, err := DrainAndRememberLimited(req, max)
+	return body, err
+}
+
+// DrainAndRememberLimited buffers at most max bytes of the request body. When the
+// body is larger it reports oversized instead of returning a truncated copy, and
+// leaves req.Body readable from the start again (buffered prefix followed by the
+// still unread remainder) so the caller can stream the body through untouched.
+func DrainAndRememberLimited(req *http.Request, max int64) ([]byte, bool, error) {
 	if req.Body == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	var reader io.Reader = req.Body
 	if max > 0 {
@@ -791,10 +800,29 @@ func DrainAndRemember(req *http.Request, max int64) ([]byte, error) {
 	}
 	body, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	if max > 0 && int64(len(body)) > max {
+		original := req.Body
+		req.Body = &rewoundBody{reader: io.MultiReader(bytes.NewReader(body), original), closer: original}
+		RememberRequestBody(req, body[:max])
+		return nil, true, nil
 	}
 	_ = req.Body.Close()
 	req.Body = io.NopCloser(bytes.NewReader(body))
 	RememberRequestBody(req, body)
-	return body, nil
+	return body, false, nil
+}
+
+type rewoundBody struct {
+	reader io.Reader
+	closer io.Closer
+}
+
+func (b *rewoundBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *rewoundBody) Close() error {
+	return b.closer.Close()
 }

@@ -90,7 +90,15 @@ func main() {
 	handler = capture.New(cfg, store, log).Middleware(handler)
 	handler = requestMiddleware(log, store, handler)
 
-	server := &http.Server{Addr: cfg.Addr(), Handler: handler}
+	// 只限制请求头读取和空闲保活：前者挡住 slowloris，后者回收堆积的空闲连接
+	// （与上游连接的 proxyConnIdleTimeout 取值一致）。ReadTimeout/WriteTimeout
+	// 是整条连接的期限，本服务要转发长时间的媒体流和上传，设了会被拦腰截断。
+	server := &http.Server{
+		Addr:              cfg.Addr(),
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 	go func() {
 		listener, err := net.Listen("tcp", cfg.Addr())
 		if err != nil {

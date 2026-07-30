@@ -157,7 +157,7 @@ func TestOutboundHeaderBuildersStripProxyMetadataHeaders(t *testing.T) {
 	}
 }
 
-func TestOutboundHeaderBuildersPreserveClientCompressionAndHopByHopHeaders(t *testing.T) {
+func TestOutboundHeaderBuildersPreserveClientCompressionAndDropHopByHopHeaders(t *testing.T) {
 	targetURL, err := url.Parse("https://upstream.example/emby/Items")
 	if err != nil {
 		t.Fatal(err)
@@ -192,17 +192,10 @@ func TestOutboundHeaderBuildersPreserveClientCompressionAndHopByHopHeaders(t *te
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			headers := tt.build(raw)
-			for key, want := range map[string]string{
-				"Accept-Encoding":  "gzip, br",
-				"Connection":       "Keep-Alive",
-				"Keep-Alive":       "timeout=5",
-				"Proxy-Connection": "keep-alive",
-				"Te":               "trailers",
-			} {
-				if got := headers.Get(key); got != want {
-					t.Fatalf("%s = %q, want passthrough %q", key, got, want)
-				}
+			if got := headers.Get("Accept-Encoding"); got != "gzip, br" {
+				t.Fatalf("Accept-Encoding = %q, want passthrough gzip, br", got)
 			}
+			assertHeaderKeysAbsent(t, headers, "Connection", "Keep-Alive", "Proxy-Connection", "Te")
 		})
 	}
 }

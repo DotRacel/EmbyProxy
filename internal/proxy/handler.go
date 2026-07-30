@@ -258,14 +258,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	capture.SetMeta(r, map[string]any{"node": parsed.Name, "impersonated": node.Impersonate})
+	trustProxy := h.trustsProxy(ctx)
+	ctx = withTrustProxy(ctx, trustProxy)
+	r = r.WithContext(ctx)
 	requestlog.SetRequestURI(ctx, logging.RedactProxyURL(r.URL.RequestURI(), parsed.Name, node.Secret))
-	LogRequestStarted(ctx, h.log, r, auth.ClientIP(r, h.trustsProxy(ctx)), parsed.Name)
+	LogRequestStarted(ctx, h.log, r, auth.ClientIP(r, trustProxy), parsed.Name)
 	parsed.Secret = node.Secret
 	strip := 1
 	if node.Secret != "" {
 		if len(parsed.Segments) < 2 || parsed.Segments[1] != node.Secret {
 			capture.SetMeta(r, map[string]any{"node": parsed.Name, "secret": node.Secret, "stage": "invalid-secret"})
-			h.log.Warn("proxy", "invalid node secret", map[string]any{"event": "invalidNodeSecret", "node": parsed.Name, "ip": auth.ClientIP(r, h.trustsProxy(ctx))})
+			h.log.Warn("proxy", "invalid node secret", map[string]any{"event": "invalidNodeSecret", "node": parsed.Name, "ip": auth.ClientIP(r, trustProxy)})
 			http.Error(w, "Node not found", http.StatusNotFound)
 			return
 		}
@@ -291,10 +294,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleWebSocket(w, r, *node, parsed)
 		return
 	}
-	body, err := h.requestBodyForReplay(w, r)
+	body, streamed, err := h.requestBodyForReplay(r)
 	if err != nil {
 		http.Error(w, "Request body error", http.StatusBadRequest)
 		return
+	}
+	if streamed != nil {
+		ctx = withStreamedRequestBody(ctx, streamed)
+		r = r.WithContext(ctx)
 	}
 	res, err := h.handleNode(ctx, r, *node, parsed, body, env)
 	if err != nil {
@@ -331,7 +338,10 @@ func (h *Handler) ResetNodeRoutingState(uid, name string) {
 
 func (h *Handler) parseRequest(r *http.Request) (parsedRoute, int, string) {
 	segments := []string{}
-	trimmed := strings.Trim(r.URL.Path, "/")
+	// Split before decoding: r.URL.Path is already decoded, so unescaping it a
+	// second time would corrupt literal percent signs and let an encoded %2F pass
+	// as a path separator.
+	trimmed := strings.Trim(r.URL.EscapedPath(), "/")
 	if trimmed != "" {
 		for _, part := range strings.Split(trimmed, "/") {
 			decoded, err := url.PathUnescape(part)
@@ -362,6 +372,11 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 	}
 	nodeKey := "admin:" + nodeName
 	expectedActive, ordered := h.targetOrder(nodeKey, targets)
+	if streamedRequestBodyFrom(ctx) != nil && len(ordered) > 1 {
+		// A streamed body is readable once, so failover would replay a consumed
+		// reader; keep the request on a single target instead.
+		ordered = ordered[:1]
+	}
 	var lastRes *http.Response
 	var lastErr error
 	var lastAttemptMS int64
@@ -388,7 +403,7 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 			continue
 		}
 		status := res.StatusCode
-		if status < 500 && status != http.StatusForbidden && status != http.StatusNotFound && status != http.StatusRequestedRangeNotSatisfiable {
+		if status < 500 && status != http.StatusForbidden && status != http.StatusNotFound {
 			h.closeBody(lastRes)
 			lastRes = nil
 			capture.ClearErrorMeta(r)
@@ -425,7 +440,7 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 				continue
 			}
 			status := res.StatusCode
-			if status < 500 && status != http.StatusForbidden && status != http.StatusNotFound && status != http.StatusRequestedRangeNotSatisfiable {
+			if status < 500 && status != http.StatusForbidden && status != http.StatusNotFound {
 				h.closeBody(lastRes)
 				lastRes = nil
 				capture.ClearErrorMeta(r)
@@ -442,7 +457,7 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 	if lastRes != nil {
 		if lastErr != nil {
 			capture.SetErrorMeta(r, "target-attempt", lastErr, map[string]any{"meta": map[string]any{"targetAttemptMs": lastAttemptMS}})
-		} else if status := lastRes.StatusCode; status >= 500 || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusRequestedRangeNotSatisfiable {
+		} else if status := lastRes.StatusCode; status >= 500 || status == http.StatusForbidden || status == http.StatusNotFound {
 			capture.SetRetryableStatusMeta(r, "target-attempt", status, lastAttemptMS)
 		}
 		return lastRes, nil
@@ -605,11 +620,69 @@ func (h *Handler) handleOneTarget(ctx context.Context, r *http.Request, node sto
 	return h.finishGeneralResponse(ctx, r, res, node, parsed, targetURL, base, currentHeaders, env, reqOrigin, isStatic, isImageAPI, isStreaming)
 }
 
-func (h *Handler) requestBodyForReplay(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+// requestBodyForReplay buffers the request body so failover can replay it. A body
+// past the replay limit is never truncated: it is handed back as a stream that is
+// forwarded once, and the caller must then keep the request to a single attempt.
+func (h *Handler) requestBodyForReplay(r *http.Request) ([]byte, *streamedRequestBody, error) {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Body == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	return capture.DrainAndRemember(r, h.cfg.Defaults.MaxRetryBodyBytes)
+	body, oversized, err := capture.DrainAndRememberLimited(r, h.cfg.Defaults.MaxRetryBodyBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	if oversized {
+		return nil, &streamedRequestBody{reader: r.Body, length: r.ContentLength}, nil
+	}
+	return body, nil, nil
+}
+
+// streamedRequestBody carries an unbuffered request body to doFetch. It can be
+// handed out once; a retry that asks for it again fails loudly instead of
+// silently sending an empty or partial body upstream.
+type streamedRequestBody struct {
+	mu     sync.Mutex
+	reader io.Reader
+	length int64
+	taken  bool
+}
+
+func (b *streamedRequestBody) take() (io.Reader, int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.taken {
+		return nil, 0, errRequestBodyConsumed
+	}
+	b.taken = true
+	return b.reader, b.length, nil
+}
+
+type streamedRequestBodyKey struct{}
+
+func withStreamedRequestBody(ctx context.Context, body *streamedRequestBody) context.Context {
+	return context.WithValue(ctx, streamedRequestBodyKey{}, body)
+}
+
+func streamedRequestBodyFrom(ctx context.Context) *streamedRequestBody {
+	if ctx == nil {
+		return nil
+	}
+	body, _ := ctx.Value(streamedRequestBodyKey{}).(*streamedRequestBody)
+	return body
+}
+
+type trustProxyKey struct{}
+
+func withTrustProxy(ctx context.Context, trust bool) context.Context {
+	return context.WithValue(ctx, trustProxyKey{}, trust)
+}
+
+func trustProxyFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	trust, _ := ctx.Value(trustProxyKey{}).(bool)
+	return trust
 }
 
 func (h *Handler) registerPlayback(r *http.Request, in storage.PlaybackInput) {
@@ -961,12 +1034,25 @@ func (h *Handler) doFetch(ctx context.Context, client *http.Client, target *url.
 		SetAccessLogField(ctx, accessLogFieldUpstreamPool, pool)
 	}
 	var reader io.Reader
-	if method != http.MethodGet && method != http.MethodHead && body != nil {
-		reader = bytes.NewReader(body)
+	contentLength := int64(-1)
+	if method != http.MethodGet && method != http.MethodHead {
+		if streamed := streamedRequestBodyFrom(ctx); streamed != nil {
+			streamReader, streamLength, err := streamed.take()
+			if err != nil {
+				return nil, err
+			}
+			reader = streamReader
+			contentLength = streamLength
+		} else if body != nil {
+			reader = bytes.NewReader(body)
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target.String(), reader)
 	if err != nil {
 		return nil, err
+	}
+	if contentLength >= 0 {
+		req.ContentLength = contentLength
 	}
 	req.Header = cloneHeader(headers)
 	req.Host = target.Host
@@ -1096,8 +1182,12 @@ func schemeHost(r *http.Request) string {
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded != "" {
-		scheme = strings.TrimSpace(strings.Split(forwarded, ",")[0])
+	// X-Forwarded-Proto is client controlled unless a trusted proxy sits in front,
+	// and the scheme ends up in origins written into rewritten payloads.
+	if trustProxyFromContext(r.Context()) {
+		if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded != "" {
+			scheme = strings.TrimSpace(strings.Split(forwarded, ",")[0])
+		}
 	}
 	return scheme + "://" + r.Host
 }
@@ -1521,7 +1611,22 @@ func retryableStatusLogFields(res *http.Response, fields map[string]any) map[str
 	return fields
 }
 
+// recordUpstreamProto records the negotiated upstream protocol on the access log
+// so it reaches both upstreamReady and requestFinished. HTTP/2 multiplexes every
+// stream to a host onto a single connection, so a connection-level failure there
+// is not scoped to one playback the way an HTTP/1.1 failure is; telling the two
+// apart matters when diagnosing interrupted streams.
+func recordUpstreamProto(ctx context.Context, res *http.Response) {
+	if ctx == nil || res == nil {
+		return
+	}
+	if proto := strings.TrimSpace(res.Proto); proto != "" {
+		SetAccessLogField(ctx, "proto", proto)
+	}
+}
+
 func responseReadyLogFields(ctx context.Context, res *http.Response, fields map[string]any) map[string]any {
+	recordUpstreamProto(ctx, res)
 	fields = withAccessLogFields(ctx, fields)
 	fields = withRedirectLocationLogField(res, fields)
 	return foldActualTargetLogField(fields, responseLogTarget(res))
@@ -1615,3 +1720,5 @@ func isRetryableProtocolStatus(status int) bool {
 }
 
 var errNoResponse = errors.New("no response")
+
+var errRequestBodyConsumed = errors.New("request body already streamed upstream")
