@@ -1131,6 +1131,18 @@ func (h *Handler) rawHostAllowedFor(ctx context.Context, node storage.Node, rawU
 	if env.ExternalAllowAny {
 		return true
 	}
+	return externalHostAllowed(node, env, rawURL.Host)
+}
+
+// externalHostAllowed matches host against the node's own targets plus the
+// configured whitelist. Whitelist entries may carry wildcards; node targets are
+// always compared literally.
+func externalHostAllowed(node storage.Node, env config.ProxyEnv, rawHost string) bool {
+	host := strings.ToLower(strings.TrimSpace(rawHost))
+	if host == "" {
+		return false
+	}
+	var patterns []string
 	allowed := map[string]bool{}
 	for _, target := range storage.SplitTargets(node.Target) {
 		if u, err := url.Parse(target); err == nil && u.Host != "" {
@@ -1138,11 +1150,117 @@ func (h *Handler) rawHostAllowedFor(ctx context.Context, node storage.Node, rawU
 		}
 	}
 	for _, item := range strings.Split(env.ExternalAllowHosts, ",") {
-		if host := strings.TrimSpace(strings.ToLower(item)); host != "" {
-			allowed[host] = true
+		entry := strings.TrimSpace(strings.ToLower(item))
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "*") {
+			patterns = append(patterns, entry)
+			continue
+		}
+		allowed[entry] = true
+	}
+	if allowed[host] {
+		return true
+	}
+	for _, pattern := range patterns {
+		if externalAllowHostMatch(pattern, host) {
+			return true
 		}
 	}
-	return allowed[strings.ToLower(rawURL.Host)]
+	return false
+}
+
+// externalAllowHostMatch reports whether host matches a whitelist pattern.
+// Both arguments must already be lowercased. Port handling stays exact, so a
+// pattern without a port never matches a host that carries one.
+//
+// A leading "*." matches subdomains at any depth but not the apex, so
+// "*.example.com" covers "a.example.com" and "a.b.example.com" but not
+// "example.com". Anywhere else a "*" stays inside a single label:
+// "v1-vod*.example.com" covers "v1-vod2.example.com" but not "v1.b.example.com".
+func externalAllowHostMatch(pattern, host string) bool {
+	if pattern == "" || host == "" {
+		return false
+	}
+	if pattern == host {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return false
+	}
+	patternHost, patternPort := SplitHostPortLoose(pattern)
+	targetHost, targetPort := SplitHostPortLoose(host)
+	if patternPort != targetPort || targetHost == "" {
+		return false
+	}
+	if suffix, ok := strings.CutPrefix(patternHost, "*."); ok && suffix != "" && !strings.Contains(suffix, "*") {
+		return strings.HasSuffix(targetHost, "."+suffix)
+	}
+	return matchHostLabels(patternHost, targetHost)
+}
+
+func matchHostLabels(pattern, host string) bool {
+	patternLabels := strings.Split(pattern, ".")
+	hostLabels := strings.Split(host, ".")
+	if len(patternLabels) != len(hostLabels) {
+		return false
+	}
+	for i, label := range patternLabels {
+		if !matchHostLabel(label, hostLabels[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// matchHostLabel globs a single hostname label, where "*" matches any run of
+// characters that contains no dot.
+func matchHostLabel(pattern, label string) bool {
+	if !strings.Contains(pattern, "*") {
+		return pattern == label
+	}
+	if label == "" {
+		return false
+	}
+	parts := strings.Split(pattern, "*")
+	prefix, suffix := parts[0], parts[len(parts)-1]
+	if !strings.HasPrefix(label, prefix) {
+		return false
+	}
+	rest := label[len(prefix):]
+	for _, middle := range parts[1 : len(parts)-1] {
+		if middle == "" {
+			continue
+		}
+		idx := strings.Index(rest, middle)
+		if idx < 0 {
+			return false
+		}
+		rest = rest[idx+len(middle):]
+	}
+	return len(rest) >= len(suffix) && strings.HasSuffix(rest, suffix)
+}
+
+// SplitHostPortLoose splits "host:port" without validating either half, so it
+// tolerates the wildcards that net.SplitHostPort rejects. Exported so the admin
+// whitelist validator splits entries exactly the way matching does.
+func SplitHostPortLoose(value string) (string, string) {
+	if strings.HasPrefix(value, "[") {
+		idx := strings.LastIndex(value, "]")
+		if idx < 0 {
+			return value, ""
+		}
+		if rest := value[idx+1:]; strings.HasPrefix(rest, ":") {
+			return value[:idx+1], rest[1:]
+		}
+		return value, ""
+	}
+	if strings.Count(value, ":") != 1 {
+		return value, ""
+	}
+	idx := strings.LastIndex(value, ":")
+	return value[:idx], value[idx+1:]
 }
 
 func rawHostBlocked(ctx context.Context, host string) bool {

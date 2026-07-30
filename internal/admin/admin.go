@@ -1421,12 +1421,20 @@ func normalizeExternalAllowHosts(value string) (string, string) {
 		if host == "" {
 			continue
 		}
-		if strings.Contains(host, "://") {
-			u, err := url.Parse(host)
-			if err != nil || u.Host == "" {
+		if idx := strings.Index(host, "://"); idx >= 0 {
+			// Extract the authority by hand: url.Parse rejects the "*" that a
+			// wildcard entry may carry.
+			rest := host[idx+3:]
+			if cut := strings.IndexAny(rest, "/?#"); cut >= 0 {
+				rest = rest[:cut]
+			}
+			if at := strings.LastIndex(rest, "@"); at >= 0 {
+				rest = rest[at+1:]
+			}
+			if rest == "" {
 				return "", "外部连接白名单包含无效 URL: " + host
 			}
-			host = u.Host
+			host = rest
 		}
 		host = strings.TrimSpace(strings.ToLower(host))
 		if host == "" {
@@ -1438,10 +1446,10 @@ func normalizeExternalAllowHosts(value string) (string, string) {
 		if strings.ContainsAny(host, "/?#") || strings.Contains(host, "@") {
 			return "", "外部连接白名单只能填写域名或 host:port"
 		}
-		if strings.Contains(host, "*") {
-			return "", "外部连接白名单不支持通配符"
+		if msg := validateWildcardHost(host); msg != "" {
+			return "", msg
 		}
-		u, err := url.Parse("//" + host)
+		u, err := url.Parse("//" + wildcardHostPlaceholder(host))
 		if err != nil || u.Host == "" {
 			return "", "外部连接白名单包含无效 host: " + host
 		}
@@ -1451,6 +1459,41 @@ func normalizeExternalAllowHosts(value string) (string, string) {
 		}
 	}
 	return strings.Join(out, ","), ""
+}
+
+// wildcardHostPlaceholder swaps "*" for a legal hostname character so the
+// result can be fed to url.Parse for a structural check.
+func wildcardHostPlaceholder(host string) string {
+	return strings.ReplaceAll(host, "*", "w")
+}
+
+// validateWildcardHost rejects wildcard entries that are malformed or so broad
+// that they would silently turn the whitelist off. It returns "" when the entry
+// is acceptable, including when it holds no wildcard at all.
+func validateWildcardHost(host string) string {
+	if !strings.Contains(host, "*") {
+		return ""
+	}
+	name, port := proxy.SplitHostPortLoose(host)
+	if strings.Contains(port, "*") {
+		return "外部连接白名单的端口不支持通配符: " + host
+	}
+	if strings.HasPrefix(name, "[") {
+		return "外部连接白名单的 IP 地址不支持通配符: " + host
+	}
+	labels := strings.Split(name, ".")
+	if len(labels) < 3 {
+		return "外部连接白名单的通配符至少需要匹配三级域名（如 *.example.com）: " + host
+	}
+	for _, label := range labels {
+		if label == "" {
+			return "外部连接白名单包含无效 host: " + host
+		}
+	}
+	if strings.Contains(labels[len(labels)-1], "*") || strings.Contains(labels[len(labels)-2], "*") {
+		return "外部连接白名单的通配符不能出现在顶级或二级域名上: " + host
+	}
+	return ""
 }
 
 func normalizeLogLevel(value, fallback string) (string, string) {

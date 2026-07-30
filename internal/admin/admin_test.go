@@ -709,3 +709,58 @@ func (f *fakeImageCacheManager) ClearImageCache(ctx context.Context) (proxy.Imag
 	f.clearCalled = true
 	return f.clearStats, f.clearErr
 }
+
+func TestNormalizeExternalAllowHostsAcceptsWildcards(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "plain host", input: "cdn.example.com", want: "cdn.example.com"},
+		{name: "subdomain wildcard", input: "*.uhdnow.com", want: "*.uhdnow.com"},
+		{name: "label glob", input: "v1-vod*.uhdnow.com", want: "v1-vod*.uhdnow.com"},
+		{name: "wildcard with port", input: "*.uhdnow.com:8443", want: "*.uhdnow.com:8443"},
+		{name: "wildcard from url", input: "https://*.uhdnow.com/path", want: "*.uhdnow.com"},
+		{name: "lowercased and deduped", input: "*.UHDNow.com, *.uhdnow.com", want: "*.uhdnow.com"},
+		{name: "newline separated", input: "*.a.example.com\nb.example.com", want: "*.a.example.com,b.example.com"},
+		{name: "deep wildcard", input: "*.*.example.com", want: "*.*.example.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, errText := normalizeExternalAllowHosts(tt.input)
+			if errText != "" {
+				t.Fatalf("normalizeExternalAllowHosts(%q) error = %q, want none", tt.input, errText)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeExternalAllowHosts(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeExternalAllowHostsRejectsBroadWildcards(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "bare star", input: "*"},
+		{name: "tld wildcard", input: "*.com"},
+		{name: "wildcard tld", input: "example.*"},
+		{name: "wildcard second level", input: "*.*"},
+		{name: "wildcard in registrable domain", input: "a.*.com"},
+		{name: "wildcard port", input: "example.com:*"},
+		{name: "wildcard ipv6", input: "[2606:4700::*]"},
+		{name: "empty label", input: "*..example.com"},
+		{name: "userinfo", input: "user@*.example.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, errText := normalizeExternalAllowHosts(tt.input)
+			if errText == "" {
+				t.Fatalf("normalizeExternalAllowHosts(%q) = %q, want an error", tt.input, got)
+			}
+		})
+	}
+}
