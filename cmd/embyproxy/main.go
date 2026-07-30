@@ -20,6 +20,7 @@ import (
 	"embyproxy/internal/config"
 	"embyproxy/internal/identity"
 	"embyproxy/internal/logging"
+	"embyproxy/internal/probe"
 	"embyproxy/internal/proxy"
 	"embyproxy/internal/requestlog"
 	"embyproxy/internal/scheduler"
@@ -40,7 +41,9 @@ func main() {
 	defaultSystemCfg := storage.DefaultSystemConfig()
 	log := logging.New(defaultSystemCfg.LogLevel, defaultSystemCfg.LogAccess)
 	defer log.Close()
-	if err := log.EnableHistory(filepath.Join(cfg.CWD, "data", "console-logs.jsonl"), logging.DefaultHistoryEntriesFile, logging.DefaultHistoryRotatedFiles); err != nil {
+	// 先按默认保留量落盘，数据库就绪后 applyRuntimeConfig 会切到用户配置的保留量。
+	defaultEntriesPerFile, defaultMaxFiles := defaultSystemCfg.LogHistoryLimits()
+	if err := log.EnableHistory(filepath.Join(cfg.CWD, "data", "console-logs.jsonl"), defaultEntriesPerFile, defaultMaxFiles); err != nil {
 		log.Warn("startup", "console log history disabled", map[string]any{"event": "consoleLogHistoryDisabled", "error": err.Error()})
 	}
 	logBuildInfo(log)
@@ -72,6 +75,11 @@ func main() {
 	checker := auth.NewChecker(cfg, store)
 	proxyHandler := proxy.New(cfg, store, ids, log)
 	adminHandler := admin.New(cfg, store, checker, tg, log, proxyHandler.ResetNodeRoutingState, proxyHandler)
+
+	probeRegistry := probe.NewRegistry()
+	prober := probe.NewProber(probeRegistry, store, log)
+	adminHandler.AttachProbes(probeRegistry, prober)
+	prober.Start(ctx)
 
 	scheduler.New(log, tg, proxyHandler.CleanupTTLMaps).Start(ctx)
 
@@ -163,6 +171,10 @@ func applyRuntimeConfig(ctx context.Context, store *storage.Store, log *logging.
 		return
 	}
 	log.Configure(systemCfg.LogLevel, systemCfg.LogAccess)
+	entriesPerFile, maxFiles := systemCfg.LogHistoryLimits()
+	if err := log.ReconfigureHistory(entriesPerFile, maxFiles); err != nil {
+		log.Warn("startup", "console log history reconfigure failed", map[string]any{"event": "consoleLogHistoryReconfigureFailed", "error": err.Error()})
+	}
 }
 
 type statusWriter struct {
