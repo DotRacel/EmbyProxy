@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -769,9 +770,26 @@ func (h *Handler) rewriteBodyLinks(ctx context.Context, text, requestURL string,
 		}
 		replacements[full] = h.signedRawLink(origin, selfPrefix, full)
 	}
+	return applyBodyLinkReplacements(text, replacements)
+}
+
+// applyBodyLinkReplacements rewrites the longest URLs first so a URL that is a
+// prefix of another one (e.g. with an extra query string) cannot corrupt it,
+// and so the result does not depend on map iteration order.
+func applyBodyLinkReplacements(text string, replacements map[string]string) string {
+	keys := make([]string, 0, len(replacements))
+	for from := range replacements {
+		keys = append(keys, from)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
 	out := text
-	for from, to := range replacements {
-		out = strings.ReplaceAll(out, from, to)
+	for _, from := range keys {
+		out = strings.ReplaceAll(out, from, replacements[from])
 	}
 	return out
 }
