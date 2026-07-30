@@ -298,13 +298,16 @@ func TestProxyRequestLogsClientUpstreamAndFinishLifecycle(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
 	}
 	entries := log.Entries(10)
-	if len(entries) != 3 {
-		t.Fatalf("entries len = %d, want 3: %+v", len(entries), entries)
+	if len(entries) != 4 {
+		t.Fatalf("entries len = %d, want 4: %+v", len(entries), entries)
 	}
+	// The upstream fixture serves a ranged body with no media content type, so the
+	// proxy reports that it is streaming without resume protection.
 	wants := [][]string{
 		{"event=requestStarted", "[access]", "node=node", "range=\"bytes=0-\""},
 		{"event=upstreamReady", "[proxy]", "node=node", "range=\"bytes=0-\"", "contentRange=\"bytes 0-4/5\""},
-		{"event=requestFinished", "[access]", "range=\"bytes=0-\"", "contentRange=\"bytes 0-4/5\""},
+		{"event=streamResumeDisabled", "[proxy]", "reason=not-media"},
+		{"event=requestFinished", "[access]", "range=\"bytes=0-\"", "contentRange=\"bytes 0-4/5\"", "streamResumeDisabled=not-media"},
 	}
 	for i, wantParts := range wants {
 		for _, want := range wantParts {

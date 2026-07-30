@@ -76,35 +76,50 @@ func upstreamClientForResponse(res *http.Response) *http.Client {
 }
 
 func (h *Handler) streamResumePlan(r *http.Request, res *http.Response) (streamResumePlan, bool) {
+	plan, ok, _ := h.streamResumePlanWithReason(r, res)
+	return plan, ok
+}
+
+// streamResumePlanWithReason builds the resume plan and, when the response is
+// rejected, names the gate that rejected it. Without the reason a stream that
+// silently loses resume protection is indistinguishable in the logs from one
+// that never needed it.
+func (h *Handler) streamResumePlanWithReason(r *http.Request, res *http.Response) (streamResumePlan, bool, string) {
 	if streamResumeMaxAttempts < 1 || r == nil || res == nil || res.Body == nil {
-		return streamResumePlan{}, false
+		return streamResumePlan{}, false, "no-body"
 	}
-	if r.Method != http.MethodGet || streamResumeSource(res) == "" {
-		return streamResumePlan{}, false
+	if r.Method != http.MethodGet {
+		return streamResumePlan{}, false, "not-get"
+	}
+	if streamResumeSource(res) == "" {
+		return streamResumePlan{}, false, "not-stream-candidate"
 	}
 	if res.Request == nil || res.Request.URL == nil || upstreamClientForResponse(res) == nil {
-		return streamResumePlan{}, false
+		return streamResumePlan{}, false, "no-upstream-client"
 	}
 	if res.Uncompressed || strings.TrimSpace(res.Header.Get("Content-Encoding")) != "" {
-		return streamResumePlan{}, false
+		return streamResumePlan{}, false, "content-encoded"
 	}
-	if !streamResumeResponseLooksLikeMedia(res) || !streamResumeAcceptsBytes(res.Header) {
-		return streamResumePlan{}, false
+	if !streamResumeResponseLooksLikeMedia(res) {
+		return streamResumePlan{}, false, "not-media"
+	}
+	if !streamResumeAcceptsBytes(res.Header) {
+		return streamResumePlan{}, false, "no-accept-ranges"
 	}
 	validator, ok := newStreamResumeValidator(res.Header)
 	if !ok {
-		return streamResumePlan{}, false
+		return streamResumePlan{}, false, streamResumeValidatorReason(res.Header)
 	}
 
 	switch res.StatusCode {
 	case http.StatusOK:
 		requestRange := strings.TrimSpace(res.Request.Header.Get("Range"))
 		if requestRange != "" && !streamResumeInitialFullRange(requestRange) {
-			return streamResumePlan{}, false
+			return streamResumePlan{}, false, "partial-range-on-200"
 		}
 		length := responseContentLength(res)
 		if length <= 0 {
-			return streamResumePlan{}, false
+			return streamResumePlan{}, false, "unknown-content-length"
 		}
 		return streamResumePlan{
 			initialStatus: res.StatusCode,
@@ -112,14 +127,17 @@ func (h *Handler) streamResumePlan(r *http.Request, res *http.Response) (streamR
 			rangeEnd:      length - 1,
 			resourceSize:  length,
 			validator:     validator,
-		}, true
+		}, true, ""
 	case http.StatusPartialContent:
-		if !streamResumeSingleByteRange(res.Request.Header.Get("Range")) || streamResumeMultipart(res.Header) {
-			return streamResumePlan{}, false
+		if !streamResumeSingleByteRange(res.Request.Header.Get("Range")) {
+			return streamResumePlan{}, false, "not-single-byte-range"
+		}
+		if streamResumeMultipart(res.Header) {
+			return streamResumePlan{}, false, "multipart-ranges"
 		}
 		start, end, total, ok := parseStreamContentRange(res.Header.Get("Content-Range"))
 		if !ok || start < 0 || end < start || total <= end {
-			return streamResumePlan{}, false
+			return streamResumePlan{}, false, "bad-content-range"
 		}
 		return streamResumePlan{
 			initialStatus: res.StatusCode,
@@ -127,9 +145,24 @@ func (h *Handler) streamResumePlan(r *http.Request, res *http.Response) (streamR
 			rangeEnd:      end,
 			resourceSize:  total,
 			validator:     validator,
-		}, true
+		}, true, ""
 	default:
-		return streamResumePlan{}, false
+		return streamResumePlan{}, false, "unsupported-status"
+	}
+}
+
+// streamResumeValidatorReason distinguishes the three ways newStreamResumeValidator
+// can fail, since each needs a different fix on the upstream side.
+func streamResumeValidatorReason(header http.Header) string {
+	etag := strings.TrimSpace(streamResumeHeader(header, "ETag"))
+	lastModified := strings.TrimSpace(streamResumeHeader(header, "Last-Modified"))
+	switch {
+	case etag != "":
+		return "weak-etag"
+	case lastModified == "":
+		return "no-validator"
+	default:
+		return "unusable-last-modified"
 	}
 }
 
