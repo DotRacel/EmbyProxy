@@ -305,9 +305,6 @@ func (s *Service) CheckKeepaliveAndNotify(ctx context.Context) error {
 			fmt.Sprintf("到期还剩：%d 天", daysLeft),
 			"上次播放：" + lastPlay,
 		}
-		if node.Note != "" {
-			lines = append(lines, "备注："+node.Note)
-		}
 		digestKey := "keepalive:digest:admin:" + node.Name + ":" + day
 		digest := storage.FNV1a(strings.Join([]string{node.Name, strconv.Itoa(node.RenewDays), strconv.Itoa(node.RemindBeforeDays), strconv.FormatInt(dueTS, 10), strconv.FormatInt(lastPlayTS, 10)}, "|"))
 		prevDigest := mustKVGet(ctx, kv, digestKey)

@@ -18,7 +18,6 @@ type Node struct {
 	Rank                *int   `json:"rank,omitempty"`
 	Secret              string `json:"secret"`
 	Tag                 string `json:"tag"`
-	Note                string `json:"note"`
 	DisplayName         string `json:"displayName"`
 	DirectExternal      bool   `json:"directExternal"`
 	RenewDays           int    `json:"renewDays"`
@@ -43,6 +42,8 @@ type TGConfig struct {
 type SystemConfig struct {
 	LogLevel                    string `json:"logLevel"`
 	LogAccess                   bool   `json:"logAccess"`
+	LogHistoryEntriesPerFile    int    `json:"logHistoryEntriesPerFile"`
+	LogHistoryMaxFiles          int    `json:"logHistoryMaxFiles"`
 	CapyStripEmby               string `json:"capyStripEmby"`
 	EmosCompat                  bool   `json:"emosCompat"`
 	EmosMatchHosts              string `json:"emosMatchHosts"`
@@ -67,12 +68,24 @@ const DefaultTrafficCaptureTextTypes = "application/json,application/xml,text/xm
 	"application/vnd.apple.mpegurl,application/x-mpegurl,application/mpegurl," +
 	"audio/mpegurl,audio/x-mpegurl,application/dash+xml"
 
+// 控制台日志落盘保留量：单文件条数 × 保留文件数。
+const (
+	DefaultLogHistoryEntriesPerFile = 2000
+	MinLogHistoryEntriesPerFile     = 200
+	MaxLogHistoryEntriesPerFile     = 100000
+	DefaultLogHistoryMaxFiles       = 20
+	MinLogHistoryMaxFiles           = 1
+	MaxLogHistoryMaxFiles           = 200
+)
+
 var targetSplitRE = regexp.MustCompile(`\r?\n|[;,，；|]+`)
 
 func DefaultSystemConfig() SystemConfig {
 	return SystemConfig{
 		LogLevel:                    "info",
 		LogAccess:                   true,
+		LogHistoryEntriesPerFile:    DefaultLogHistoryEntriesPerFile,
+		LogHistoryMaxFiles:          DefaultLogHistoryMaxFiles,
 		CapyStripEmby:               "0",
 		TrustProxy:                  false,
 		ImageProxyLimitEnabled:      false,
@@ -84,6 +97,20 @@ func DefaultSystemConfig() SystemConfig {
 		TrafficCaptureBodyMax:       262144,
 		TrafficCaptureTextTypes:     DefaultTrafficCaptureTextTypes,
 	}
+}
+
+// LogHistoryLimits 返回可直接交给日志组件的保留量参数。
+// 旧配置里没有这两个字段（读出来是 0）或值超出范围时回落到默认值。
+func (c SystemConfig) LogHistoryLimits() (entriesPerFile int, maxFiles int) {
+	entriesPerFile = c.LogHistoryEntriesPerFile
+	if entriesPerFile < MinLogHistoryEntriesPerFile || entriesPerFile > MaxLogHistoryEntriesPerFile {
+		entriesPerFile = DefaultLogHistoryEntriesPerFile
+	}
+	maxFiles = c.LogHistoryMaxFiles
+	if maxFiles < MinLogHistoryMaxFiles || maxFiles > MaxLogHistoryMaxFiles {
+		maxFiles = DefaultLogHistoryMaxFiles
+	}
+	return entriesPerFile, maxFiles
 }
 
 type PlayStat struct {
@@ -126,7 +153,6 @@ type packedNode struct {
 	Rank                *int   `json:"r,omitempty"`
 	Secret              string `json:"s,omitempty"`
 	Tag                 string `json:"g,omitempty"`
-	Note                string `json:"n,omitempty"`
 	DisplayName         string `json:"d,omitempty"`
 	DirectExternal      int    `json:"de,omitempty"`
 	RenewDays           int    `json:"xd,omitempty"`
@@ -144,7 +170,6 @@ func PackNode(node Node) (string, error) {
 		Rank:               node.Rank,
 		Secret:             node.Secret,
 		Tag:                node.Tag,
-		Note:               node.Note,
 		DisplayName:        node.DisplayName,
 		RenewDays:          node.RenewDays,
 		RemindBeforeDays:   node.RemindBeforeDays,
@@ -187,7 +212,6 @@ func UnpackNode(name, packed string) (Node, bool) {
 		Rank:                p.Rank,
 		Secret:              p.Secret,
 		Tag:                 p.Tag,
-		Note:                p.Note,
 		DisplayName:         p.DisplayName,
 		DirectExternal:      p.DirectExternal != 0,
 		RenewDays:           p.RenewDays,

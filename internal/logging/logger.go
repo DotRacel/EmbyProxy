@@ -25,6 +25,9 @@ const (
 	DefaultHistoryRotatedFiles = 20
 	logHistoryBufferSize       = 64 * 1024
 	logHistoryFlushInterval    = time.Second
+	// 清理时多扫一段轮转文件，避免上一次运行用了更大的保留文件数时留下孤儿文件。
+	// 与 storage.MaxLogHistoryMaxFiles 保持一致。
+	logHistorySweepFiles = 200
 )
 
 var (
@@ -337,6 +340,33 @@ func (l *Logger) EnableHistory(path string, entriesPerFile, maxFiles int) error 
 	return nil
 }
 
+// ReconfigureHistory 在不重启、不丢弃已有日志的前提下调整落盘保留量。
+// 未启用落盘历史时是空操作。
+func (l *Logger) ReconfigureHistory(entriesPerFile, maxFiles int) error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.history == nil {
+		return nil
+	}
+	return l.history.Reconfigure(entriesPerFile, maxFiles)
+}
+
+// HistorySettings 返回当前生效的落盘保留量；ok 为 false 表示未启用落盘历史。
+func (l *Logger) HistorySettings() (entriesPerFile int, maxFiles int, ok bool) {
+	if l == nil {
+		return 0, 0, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.history == nil {
+		return 0, 0, false
+	}
+	return l.history.Settings()
+}
+
 func (l *Logger) Close() error {
 	if l == nil {
 		return nil
@@ -586,14 +616,75 @@ func (h *logHistory) reset() error {
 	if err := h.closeWriterLocked(); err != nil {
 		return err
 	}
-	for _, path := range h.pathsNewestFirst() {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
+	if err := h.removeRotatedLocked(0); err != nil {
+		return err
 	}
 	h.entryCount = 0
 	h.retainedEntries = 0
 	h.oldestID = 0
+	return nil
+}
+
+// Reconfigure 调整保留量并清掉超出新保留范围的轮转文件；当前正在写的文件句柄保持可用。
+func (h *logHistory) Reconfigure(entriesPerFile, maxFiles int) error {
+	if h == nil {
+		return nil
+	}
+	if entriesPerFile < 1 {
+		entriesPerFile = DefaultHistoryEntriesFile
+	}
+	if maxFiles < 1 {
+		maxFiles = DefaultHistoryRotatedFiles
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	if h.entriesPerFile == entriesPerFile && h.maxFiles == maxFiles {
+		return nil
+	}
+	// 先落盘，避免删轮转文件时丢掉缓冲区里的内容。
+	if err := h.flushWriterLocked(); err != nil {
+		return err
+	}
+	if err := h.removeRotatedLocked(maxFiles); err != nil {
+		return err
+	}
+	h.entriesPerFile = entriesPerFile
+	h.maxFiles = maxFiles
+	// 缩小保留量后，估算值可能超过新容量；沿用 rotateLocked 的近似口径修正。
+	if capacity := h.entriesPerFile * h.maxFiles; capacity > 0 && h.retainedEntries > capacity {
+		h.oldestID += uint64(h.retainedEntries - capacity)
+		h.retainedEntries = capacity
+	}
+	// 当前文件已经写满新的单文件条数时，下一条 Append 会自然触发轮转。
+	return nil
+}
+
+func (h *logHistory) Settings() (int, int, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.entriesPerFile, h.maxFiles, true
+}
+
+// removeRotatedLocked 删除索引 >= keep 的轮转文件；keep 为 0 时连当前文件一起删。
+func (h *logHistory) removeRotatedLocked(keep int) error {
+	if keep <= 0 {
+		if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		keep = 1
+	}
+	sweep := logHistorySweepFiles
+	if h.maxFiles > sweep {
+		sweep = h.maxFiles
+	}
+	for i := keep; i <= sweep; i++ {
+		if err := os.Remove(rotatedLogPath(h.path, i)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -794,14 +885,6 @@ func (h *logHistory) rotateLocked() error {
 	}
 	h.entryCount = 0
 	return nil
-}
-
-func (h *logHistory) pathsNewestFirst() []string {
-	paths := []string{h.path}
-	for i := 1; i < h.maxFiles; i++ {
-		paths = append(paths, rotatedLogPath(h.path, i))
-	}
-	return paths
 }
 
 func (h *logHistory) pathsOldestFirst() []string {
