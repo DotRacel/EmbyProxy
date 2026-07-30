@@ -294,10 +294,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleWebSocket(w, r, *node, parsed)
 		return
 	}
-	body, err := h.requestBodyForReplay(w, r)
+	body, streamed, err := h.requestBodyForReplay(r)
 	if err != nil {
 		http.Error(w, "Request body error", http.StatusBadRequest)
 		return
+	}
+	if streamed != nil {
+		ctx = withStreamedRequestBody(ctx, streamed)
+		r = r.WithContext(ctx)
 	}
 	res, err := h.handleNode(ctx, r, *node, parsed, body, env)
 	if err != nil {
@@ -368,6 +372,11 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 	}
 	nodeKey := "admin:" + nodeName
 	expectedActive, ordered := h.targetOrder(nodeKey, targets)
+	if streamedRequestBodyFrom(ctx) != nil && len(ordered) > 1 {
+		// A streamed body is readable once, so failover would replay a consumed
+		// reader; keep the request on a single target instead.
+		ordered = ordered[:1]
+	}
 	var lastRes *http.Response
 	var lastErr error
 	var lastAttemptMS int64
@@ -611,11 +620,55 @@ func (h *Handler) handleOneTarget(ctx context.Context, r *http.Request, node sto
 	return h.finishGeneralResponse(ctx, r, res, node, parsed, targetURL, base, currentHeaders, env, reqOrigin, isStatic, isImageAPI, isStreaming)
 }
 
-func (h *Handler) requestBodyForReplay(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+// requestBodyForReplay buffers the request body so failover can replay it. A body
+// past the replay limit is never truncated: it is handed back as a stream that is
+// forwarded once, and the caller must then keep the request to a single attempt.
+func (h *Handler) requestBodyForReplay(r *http.Request) ([]byte, *streamedRequestBody, error) {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Body == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	return capture.DrainAndRemember(r, h.cfg.Defaults.MaxRetryBodyBytes)
+	body, oversized, err := capture.DrainAndRememberLimited(r, h.cfg.Defaults.MaxRetryBodyBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	if oversized {
+		return nil, &streamedRequestBody{reader: r.Body, length: r.ContentLength}, nil
+	}
+	return body, nil, nil
+}
+
+// streamedRequestBody carries an unbuffered request body to doFetch. It can be
+// handed out once; a retry that asks for it again fails loudly instead of
+// silently sending an empty or partial body upstream.
+type streamedRequestBody struct {
+	mu     sync.Mutex
+	reader io.Reader
+	length int64
+	taken  bool
+}
+
+func (b *streamedRequestBody) take() (io.Reader, int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.taken {
+		return nil, 0, errRequestBodyConsumed
+	}
+	b.taken = true
+	return b.reader, b.length, nil
+}
+
+type streamedRequestBodyKey struct{}
+
+func withStreamedRequestBody(ctx context.Context, body *streamedRequestBody) context.Context {
+	return context.WithValue(ctx, streamedRequestBodyKey{}, body)
+}
+
+func streamedRequestBodyFrom(ctx context.Context) *streamedRequestBody {
+	if ctx == nil {
+		return nil
+	}
+	body, _ := ctx.Value(streamedRequestBodyKey{}).(*streamedRequestBody)
+	return body
 }
 
 type trustProxyKey struct{}
@@ -981,12 +1034,25 @@ func (h *Handler) doFetch(ctx context.Context, client *http.Client, target *url.
 		SetAccessLogField(ctx, accessLogFieldUpstreamPool, pool)
 	}
 	var reader io.Reader
-	if method != http.MethodGet && method != http.MethodHead && body != nil {
-		reader = bytes.NewReader(body)
+	contentLength := int64(-1)
+	if method != http.MethodGet && method != http.MethodHead {
+		if streamed := streamedRequestBodyFrom(ctx); streamed != nil {
+			streamReader, streamLength, err := streamed.take()
+			if err != nil {
+				return nil, err
+			}
+			reader = streamReader
+			contentLength = streamLength
+		} else if body != nil {
+			reader = bytes.NewReader(body)
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target.String(), reader)
 	if err != nil {
 		return nil, err
+	}
+	if contentLength >= 0 {
+		req.ContentLength = contentLength
 	}
 	req.Header = cloneHeader(headers)
 	req.Host = target.Host
@@ -1654,3 +1720,5 @@ func isRetryableProtocolStatus(status int) bool {
 }
 
 var errNoResponse = errors.New("no response")
+
+var errRequestBodyConsumed = errors.New("request body already streamed upstream")
