@@ -1959,24 +1959,6 @@ div.form-hint { margin-top: 5px; }
 .node-check:checked,
 .node-check:focus-visible { opacity: 1; }
 
-/* 拖拽排序状态 */
-.node-card.dragging {
-  opacity: .45;
-  transform: scale(.985);
-  cursor: grabbing;
-}
-.node-card.drag-over { box-shadow: inset 0 0 0 1px rgba(145, 132, 217, .45); }
-.node-card.drag-over::before {
-  content: "";
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  top: -7px;
-  height: 2px;
-  border-radius: 2px;
-  background: var(--color-accent);
-}
-
 /* 离线状态（与 .is-offline / .node-dot.off 同族的别名） */
 .node-card.offline {
   background: rgba(35, 37, 50, .5);
@@ -2231,7 +2213,7 @@ div.form-hint { margin-top: 5px; }
    和 .upstream-list 中间就成了一段悬空的留白，占位文案时尤其明显（见 shots3/03）。
    给画布本身补一条描边，让它和上下两个分组同属一个视觉层级。
 
-   边框只包画布、不包标题行：本屏所有 h6（上游线路 / 最近事件 / 身份与标签）都是
+   边框只包画布、不包标题行：本屏所有 h6（上游线路 / 身份与标签）都是
    容器外的段标题，标题行右侧的「最高 x ms」是这条标题的附属信息，一起留在外面才
    跟 .upstream-list 的结构对齐。同时描边只圈住图形区域，视觉重量也最轻，不会盖过
    紧挨着的 .kpi-grid。
@@ -2466,10 +2448,6 @@ button:disabled {
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17V6M8 9.5l4-4 4 4"></path><path d="M4 18.5v1.5h16v-1.5"></path></svg>
                 导出
               </button>
-              <button class="more-item" type="button" role="menuitem" onclick="doSaveOrder()" title="拖动节点后保存当前排序">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h11M4 12h11M4 18h7"></path><path d="M18 8.5V19M15.5 16.5L18 19l2.5-2.5"></path></svg>
-                保存排序
-              </button>
             </div>
           </div>
         </div>
@@ -2524,7 +2502,7 @@ button:disabled {
           <div class="detail-col" id="nodeDetail" aria-live="polite">
             <div class="empty-state">
               <b>选择左侧的 Emby 节点</b>
-              <span>这里会显示上游线路、延迟趋势、身份策略与最近事件</span>
+              <span>这里会显示上游线路、延迟趋势与身份策略</span>
             </div>
           </div>
         </section>
@@ -2597,6 +2575,10 @@ button:disabled {
                     <span>容量上限</span>
                     <span class="mono" id="statsImageCacheLimit" style="flex:none;color:rgba(233,233,237,.6)">--</span>
                   </div>
+                  <div style="display:flex;justify-content:space-between;gap:12px;font-size:13px">
+                    <span id="statsImageCacheHitLabel">命中率</span>
+                    <span class="mono" id="statsImageCacheHit" style="flex:none;color:rgba(233,233,237,.6)">--</span>
+                  </div>
                 </div>
               </div>
             </section>
@@ -2646,6 +2628,11 @@ button:disabled {
               <option value="warn">WARN</option>
               <option value="info">INFO</option>
               <option value="debug">DEBUG</option>
+            </select>
+
+            <label class="sr-only" for="logNodeFilter">按节点筛选</label>
+            <select class="input log-level-filter" id="logNodeFilter" onchange="setLogNodeFilter(this.value)" title="按节点筛选">
+              <option value="">全部节点</option>
             </select>
 
             <label class="log-live-switch" for="logAutoRefresh" title="实时日志">
@@ -3374,7 +3361,6 @@ let twoFactorFlowGeneration = 0;
 let allNodes = [];
 let editingNode = null;
 let selectedNodes = new Set();
-let draggingNode = '';
 let nodeChecks = {};
 let focusedNodeName = '';
 let appBuild = null;
@@ -3388,6 +3374,7 @@ let lastLogEntries = [];
 let lastLogMeta = {};
 let currentLogLevelFilter = 'all';
 let currentLogQuery = '';
+let currentLogNodeFilter = '';
 let logSearchTimer = null;
 let logStreamController = null;
 let logStreamToken = 0;
@@ -3407,14 +3394,12 @@ let todayOutbound = {};
 let todaySessions = 0;
 let selectedNodeName = '';
 let detailSeries = null;
-let detailEvents = { name: '', items: [] };
 let drawerTargets = [''];
 let probeTimer = null;
 let relativeTimer = null;
 let currentStatsRange = 7;
 let currentLogMode = 'req';
 let detailSeriesToken = 0;
-let detailEventsToken = 0;
 
 const LOG_PAGE_LIMIT = 2000;
 const LOG_DOM_LIMIT = 4000;
@@ -3996,6 +3981,7 @@ async function loadNodes() {
   allNodes = r.nodes || [];
   syncNodeState();
   renderTagFilter();
+  if (typeof renderLogNodeFilter === 'function') renderLogNodeFilter();
   filterNodes();
   loadProbes();
   loadTodayTraffic();
@@ -4017,7 +4003,6 @@ function syncNodeState() {
       selectedNodeName = first.name;
       focusedNodeName = first.name;
       loadNodeSeries(first.name);
-      loadNodeEvents(first.name);
     }
   }
 }
@@ -4239,10 +4224,8 @@ function nodeCardMarkup(n) {
       <div class="mono node-card-ms" style="font-size:11.5px;margin-left:auto">${esc(probeLatencyText(stat?.lastMs, state, stat?.lastError))}</div>
     </div>`;
   }
-  return `<article class="node-card${active ? ' is-active' : ''}${state === 'offline' ? ' is-offline' : ''}" id="node-${attr(name)}" draggable="true"
-    onclick="onNodeCardClick(event,'${arg}')"
-    ondragstart="onNodeDragStart(event,'${arg}')" ondragend="onNodeDragEnd()"
-    ondragover="onNodeDragOver(event,'${arg}')" ondragenter="onNodeDragEnter(event,'${arg}')" ondrop="onNodeDrop(event,'${arg}')">
+  return `<article class="node-card${active ? ' is-active' : ''}${state === 'offline' ? ' is-offline' : ''}" id="node-${attr(name)}"
+    onclick="onNodeCardClick(event,'${arg}')">
     <div class="node-card-head" style="display:flex;align-items:center;gap:9px">
       <input type="checkbox" class="node-check" ${sel ? 'checked' : ''} onchange="toggleSelect('${arg}',this.checked)" aria-label="选择节点"/>
       ${nodeStatusDot(state)}
@@ -4267,79 +4250,6 @@ function selectNode(name) {
   renderNodeList(getFilteredNodes());
   renderNodeDetail();
   loadNodeSeries(name);
-  loadNodeEvents(name);
-}
-
-function onNodeDragStart(event, name) {
-  draggingNode = name;
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = 'move';
-    event.dataTransfer.setData('text/plain', name);
-  }
-  const row = document.getElementById('node-' + name);
-  if (row) row.classList.add('dragging');
-}
-
-function onNodeDragOver(event, targetName) {
-  if (!draggingNode || draggingNode === targetName) return;
-  event.preventDefault();
-  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
-}
-
-function onNodeDragEnter(event, targetName) {
-  if (!draggingNode || draggingNode === targetName) return;
-  clearNodeDragClasses();
-  const row = document.getElementById('node-' + targetName);
-  if (row) row.classList.add('drag-over');
-}
-
-function onNodeDrop(event, targetName) {
-  event.preventDefault();
-  const sourceName = draggingNode || event.dataTransfer?.getData('text/plain') || '';
-  const source = allNodes.find(n => n.name === sourceName);
-  const target = allNodes.find(n => n.name === targetName);
-  const afterTarget = shouldDropAfter(event, event.currentTarget);
-  clearNodeDragState();
-  if (!source || !target || sourceName === targetName) return;
-  if (!!source.fav !== !!target.fav) {
-    toast('收藏项会固定在前，请在同组内排序', 'info');
-    return;
-  }
-  moveNodeBeforeOrAfter(sourceName, targetName, afterTarget);
-  filterNodes();
-  toast('排序已调整，点击保存排序生效', 'info');
-}
-
-function onNodeDragEnd() {
-  clearNodeDragState();
-}
-
-function shouldDropAfter(event, row) {
-  if (!row || !row.getBoundingClientRect) return false;
-  const rect = row.getBoundingClientRect();
-  return event.clientY > rect.top + rect.height / 2;
-}
-
-function moveNodeBeforeOrAfter(sourceName, targetName, afterTarget) {
-  const from = allNodes.findIndex(n => n.name === sourceName);
-  let to = allNodes.findIndex(n => n.name === targetName);
-  if (from < 0 || to < 0 || from === to) return;
-  const [node] = allNodes.splice(from, 1);
-  if (from < to) to--;
-  if (afterTarget) to++;
-  to = Math.max(0, Math.min(to, allNodes.length));
-  allNodes.splice(to, 0, node);
-}
-
-function clearNodeDragClasses() {
-  document.querySelectorAll('.node-card.drag-over').forEach(el => el.classList.remove('drag-over'));
-}
-
-function clearNodeDragState() {
-  draggingNode = '';
-  document.querySelectorAll('.node-card.dragging,.node-card.drag-over').forEach(el => {
-    el.classList.remove('dragging', 'drag-over');
-  });
 }
 
 function toggleSelect(name, checked) {
@@ -4375,7 +4285,7 @@ function renderNodeDetail() {
   const node = allNodes.find(n => n.name === selectedNodeName);
   if (!node) {
     el.innerHTML = allNodes.length
-      ? '<div class="empty-state text-muted"><b>选择左侧的一个节点</b><span>这里会显示延迟曲线、上游线路与最近事件</span></div>'
+      ? '<div class="empty-state text-muted"><b>选择左侧的一个节点</b><span>这里会显示延迟曲线与上游线路</span></div>'
       : '<div class="empty-state text-muted"><b>还没有节点可查看</b><span>先创建一个 Emby 节点，这里会显示它的运行状况</span></div>';
     return;
   }
@@ -4437,8 +4347,6 @@ function renderNodeDetail() {
       <div>
         <h6 style="margin:0 0 8px;color:var(--color-neutral-300)">上游线路</h6>
         ${detailTargetsMarkup(node, stat)}
-        <h6 style="margin:20px 0 8px;color:var(--color-neutral-300)">最近事件</h6>
-        <div class="mono text-muted" id="detailEvents" style="font-size:11.5px;line-height:1.8">加载中…</div>
       </div>
       <div>
         <h6 style="margin:0 0 8px;color:var(--color-neutral-300)">身份与标签</h6>
@@ -4453,7 +4361,6 @@ function renderNodeDetail() {
     </div>
   `;
   renderDetailChart();
-  renderDetailEvents();
 }
 
 function detailTargetsMarkup(node, stat) {
@@ -4552,61 +4459,28 @@ function renderDetailChart() {
   if (maxEl) maxEl.textContent = `最高 ${Math.round(max)} ms`;
 }
 
-async function loadNodeEvents(name) {
-  if (!name) return;
-  const token = ++detailEventsToken;
-  const r = await api('logs.list', { limit: 200, page: 1, level: 'all', query: name });
-  if (token !== detailEventsToken || selectedNodeName !== name) return;
-  const logs = r.ok && Array.isArray(r.logs) ? r.logs : [];
-  detailEvents = { name, items: logs.slice(-6).reverse() };
-  renderDetailEvents();
-}
-
-function renderDetailEvents() {
-  const el = document.getElementById('detailEvents');
-  if (!el) return;
-  if (!detailEvents || detailEvents.name !== selectedNodeName) {
-    el.textContent = '加载中…';
-    return;
-  }
-  if (!detailEvents.items.length) {
-    el.textContent = '暂无相关事件';
-    return;
-  }
-  el.innerHTML = detailEvents.items.map(log => esc(compactEventLine(log.line))).join('<br>');
-}
-
-function compactEventLine(line) {
-  const raw = String(line || '').trim();
-  const time = raw.match(/\d{2}:\d{2}:\d{2}/);
-  const m = raw.match(/^(\S+)\s+(\[[A-Z]+\])\s?([\s\S]*)$/);
-  const message = (m ? m[3] : raw).replace(/\s+/g, ' ').trim();
-  const short = message.length > 96 ? message.slice(0, 96) + '…' : message;
-  return time ? `${time[0]} · ${short}` : short;
-}
-
 /* ============================================================
  * 头部指标
  * ============================================================ */
 
 function renderHeadStatus() {
   const statusEl = document.getElementById('headStatus');
-  let reachable = 0;
-  let offline = 0;
   let latencySum = 0;
   let latencyCount = 0;
-  let latestAt = 0;
   for (const n of allNodes) {
     const stat = nodeProbe(n.name);
-    const state = nodeProbeState(n.name);
-    if (state === 'online') reachable++;
-    else if (state === 'offline') offline++;
     const ms = Number(stat?.lastMs);
     if (Number.isFinite(ms) && ms >= 0) { latencySum += ms; latencyCount++; }
-    const at = Number(stat?.lastAt || 0);
-    if (at > latestAt) latestAt = at;
   }
-  if (statusEl) statusEl.textContent = `${allNodes.length} 个节点 · ${reachable} 可达`;
+  // 节点数与可达性在左侧卡片列表里已经一目了然，标题栏再写一遍纯属重复，
+  // 副标题的同一句话也一并去掉（副标题交还给 switchTab 的静态文案）。
+  // #headStatus 是三个页签共用的，统计页/日志页的摘要仍由 renderPaneMetrics 写入，
+  // 所以这里只在节点页把它隐藏——.head-status 自带 display:flex，
+  // hidden 属性压不住，必须用行内 display 才不会在 .head-metrics 的 gap 里留一段空档。
+  if (statusEl && currentTab === 'nodes') {
+    statusEl.textContent = '';
+    statusEl.style.display = 'none';
+  }
 
   const metrics = document.getElementById('headMetrics');
   if (metrics) {
@@ -4629,17 +4503,6 @@ function renderHeadStatus() {
         <div class="head-metric-label">平均首字节</div>
       </div>
     `;
-  }
-
-  if (currentTab === 'nodes') {
-    const subtitle = document.getElementById('pageSubtitle');
-    if (subtitle) {
-      const reach = offline > 0 ? `${offline} 个不可达` : '全部上游可达';
-      const checked = latestAt
-        ? `最近检测 <span data-rel-at="${latestAt}" data-rel-style="ago">${esc(formatRelativeTime(latestAt))}</span>`
-        : '尚未检测';
-      subtitle.innerHTML = `${allNodes.length} 个节点 · ${esc(reach)} · ${checked}`;
-    }
   }
 }
 
@@ -4733,7 +4596,6 @@ function getNodeFormData() {
     keepaliveMaxPerDay: parseInt(g('keepaliveMaxPerDay') || '1'),
     keepaliveChangeOnly: document.getElementById('f-keepaliveChangeOnly').checked,
     fav: editingNode?.fav || false,
-    rank: editingNode?.rank,
   };
 }
 
@@ -4917,12 +4779,6 @@ async function doExport() {
   toast(`已导出 ${nodes.length} 个节点`, 'ok');
 }
 
-async function doSaveOrder() {
-  const order = allNodes.map(n => n.name);
-  const r = await api('saveOrder', { order });
-  toast(r.ok ? '排序已保存' : '失败: ' + (r.error || ''), r.ok ? 'ok' : 'err');
-}
-
 function testKeepaliveFromButton(btn) {
   testKeepalive(btn.dataset.name, btn.dataset.display, parseInt(btn.dataset.renew || '0'), parseInt(btn.dataset.remind || '0'), btn.dataset.at || '00:00');
 }
@@ -5039,7 +4895,11 @@ function syncStatsRangeControls() {
 /* 头部指标：#headStatus 只放摘要文案，指标块沿用 app-1 的 #headMetricBox 结构 */
 function renderPaneMetrics(statusText, metrics) {
   const statusEl = document.getElementById('headStatus');
-  if (statusEl) statusEl.textContent = statusText;
+  if (statusEl) {
+    // 节点页把它藏了（renderHeadStatus），统计页/日志页要把摘要重新显示出来。
+    statusEl.style.display = '';
+    statusEl.textContent = statusText;
+  }
   const wrap = document.getElementById('headMetrics');
   if (!wrap) return;
   let box = document.getElementById('headMetricBox');
@@ -5149,6 +5009,25 @@ function renderStatsImageCache(cache) {
     bar.style.width = `${(ratio * 100).toFixed(1)}%`;
     bar.style.background = near ? 'var(--color-warn)' : '';
   }
+
+  // 命中率是进程内、自统计起点以来的口径，所以标签上要带时间范围，
+  // 否则一个没有时间窗口的裸百分比容易被误读成历史总命中率。
+  const lookups = Math.max(0, Number(cache.lookups || 0));
+  const hitEl = document.getElementById('statsImageCacheHit');
+  const hitLabel = document.getElementById('statsImageCacheHitLabel');
+  if (hitEl) {
+    hitEl.textContent = lookups > 0
+      ? `${Math.round(Number(cache.hitRate || 0) * 100)}%  ${formatCacheNumber(cache.hits)}/${formatCacheNumber(lookups)}`
+      : '暂无请求';
+  }
+  if (hitLabel) {
+    // 没有样本时不带时间范围：刚启动/刚清空时统计起点就是此刻，
+    // 会渲染成「命中率 · 0 秒内」这种读不通的文字。
+    const since = Number(cache.statsSince || 0);
+    const span = since > 0 ? formatRelativeSpan(since * 1000) : '';
+    hitLabel.textContent = lookups > 0 && span ? `命中率 · 近 ${span}` : '命中率';
+  }
+
   block.hidden = false;
 }
 
@@ -5379,15 +5258,16 @@ async function loadLogs(showToast = false, page = currentLogPage, options = {}) 
   const previousNewestId = Number(lastLogMeta?.newestId || 0);
   currentLogPage = requestedPage;
   const requestLevel = currentLogLevelFilter;
-  const requestQuery = currentLogQuery;
+  const requestNode = currentLogNodeFilter;
+  const requestSearch = currentLogQuery;
   const requestLogViewEpoch = logViewEpoch;
-  const payload = { limit: LOG_PAGE_LIMIT, page: requestedPage, level: requestLevel, query: requestQuery };
+  const payload = { limit: LOG_PAGE_LIMIT, page: requestedPage, level: requestLevel, query: requestSearch, node: requestNode };
   const r = await api('logs.list', payload);
   if (!r.ok) {
     toast('加载日志失败: ' + (r.error || ''), 'err');
     return false;
   }
-  if (requestLevel !== currentLogLevelFilter || requestQuery !== currentLogQuery) {
+  if (requestLevel !== currentLogLevelFilter || requestNode !== currentLogNodeFilter || requestSearch !== currentLogQuery) {
     return false;
   }
   if (requestLogViewEpoch !== logViewEpoch) {
@@ -5422,7 +5302,9 @@ async function loadLogs(showToast = false, page = currentLogPage, options = {}) 
   currentLogHasOlder = currentLogTotalPages > currentLogPage || !!r.hasOlder;
   if (currentLogPage === 1) {
     lastLogSeenId = mergedNewestId;
-    if (requestQuery === '') {
+    // 只在搜索框为空时同步流水号：搜索会关掉实时流（isLogStreamAllowed），
+    // 节点筛选不会，所以这里看的是搜索词而不是下推给服务端的 query。
+    if (requestSearch === '') {
       lastLogStreamId = streamSequenceReset ? nextStreamId : Math.max(lastLogStreamId, nextStreamId);
     }
   }
@@ -5530,6 +5412,51 @@ function mergeLogsWithStreamedEntries(snapshotLogs, options = {}) {
   return [...snapshotLogs, ...streamedLogs].slice(-LOG_DOM_LIMIT);
 }
 
+/* 节点筛选：选项来自节点列表（值用 name，显示用 displayName），节点增删后由 loadNodes 重建。 */
+function renderLogNodeFilter() {
+  const sel = document.getElementById('logNodeFilter');
+  if (!sel) return;
+  const nodes = Array.isArray(allNodes) ? allNodes : [];
+  if (currentLogNodeFilter && !nodes.some(n => n.name === currentLogNodeFilter)) {
+    // 选中的节点被删掉了：静默回到「全部节点」，不去动当前页，等下一次刷新自然生效。
+    currentLogNodeFilter = '';
+  }
+  sel.innerHTML = '<option value="">全部节点</option>'
+    + nodes.map(n => `<option value="${attr(n.name)}">${esc(n.displayName || n.name)}</option>`).join('');
+  sel.value = currentLogNodeFilter;
+}
+
+function setLogNodeFilter(value) {
+  const next = String(value || '').trim();
+  const nodes = Array.isArray(allNodes) ? allNodes : [];
+  currentLogNodeFilter = nodes.some(n => n.name === next) ? next : '';
+  const sel = document.getElementById('logNodeFilter');
+  if (sel) sel.value = currentLogNodeFilter;
+  loadLogs(false, 1);
+}
+
+/* 节点名在日志里出现的形态不止一种：
+ *   access requestStarted  → uri=/uhdnow/... 且 node=uhdnow
+ *   proxy  upstreamReady   → node=uhdnow（没有 uri）
+ *   access requestFinished → uri=/uhdnow/...（没有 node=，字段由 AccessLogFields 拼，不含节点名）
+ * 所以 `node=X` 会漏掉最关键的那条 INFO 完成行，`/X/` 又会漏掉所有 proxy/ws 行，
+ * 只有裸节点名能同时覆盖三类。后端 LogFilter 也正是对整行做小写子串匹配，
+ * 这里保持同一套判定，服务端分页结果和 SSE 增量才不会一个松一个紧。 */
+function logEntryMatchesNode(entry, node) {
+  if (!node) return true;
+  return String(entry?.line || '').toLowerCase().includes(node.toLowerCase());
+}
+
+/* 节点筛选与搜索词是两个独立维度，各自作为 node / query 下推到服务端取交集。
+ * 早期后端只收一个 query，只能让节点筛选占用它、搜索词退化成当前页内过滤，
+ * 那样分页总数按节点筛选算、页内又被二次删行，第 N 页可能只剩几行。
+ * 后端加了独立的 node 参数后这个妥协就不需要了。 */
+function logNodeLabel(name) {
+  const node = (Array.isArray(allNodes) ? allNodes : []).find(n => n.name === name);
+  return node ? (node.displayName || node.name) : name;
+}
+
+
 function setLogLevelFilter(value) {
   const level = String(value || 'all').toLowerCase();
   currentLogLevelFilter = ['all', 'error', 'warn', 'info', 'debug'].includes(level) ? level : 'all';
@@ -5598,10 +5525,15 @@ function renderLogHeadStatus(logs) {
   const latest = logs.length ? String(logs[logs.length - 1].level || '-').toUpperCase() : '-';
   // 摘要不要重复右侧指标块里的同一组数字，改说当前的筛选与分页状态。
   const scope = currentLogLevelFilter === 'all' ? '全部等级' : currentLogLevelFilter.toUpperCase();
-  const summary = currentLogQuery
-    ? `${scope} · 搜索「${currentLogQuery}」`
-    : `${scope} · 第 ${currentLogPage}/${currentLogTotalPages} 页`;
-  renderPaneMetrics(summary, [
+  const parts = [scope];
+  if (currentLogNodeFilter) parts.push(`节点「${logNodeLabel(currentLogNodeFilter)}」`);
+  if (currentLogQuery) {
+    // 节点筛选占了服务端 query，此时搜索只在当前页里生效，说清楚免得以为翻页也算数。
+    parts.push(`搜索「${currentLogQuery}」`);
+  } else {
+    parts.push(`第 ${currentLogPage}/${currentLogTotalPages} 页`);
+  }
+  renderPaneMetrics(parts.join(' · '), [
     [String(logs.length), '行', '当前日志'],
     [latest, '', '最新等级'],
   ]);
@@ -5774,6 +5706,7 @@ function scheduleLogGapRefresh() {
 
 function logMatchesCurrentFilter(entry) {
   if (currentLogLevelFilter !== 'all' && safeLogLevel(entry.level) !== currentLogLevelFilter) return false;
+  if (!logEntryMatchesNode(entry, currentLogNodeFilter)) return false;
   const query = currentLogQuery.toLowerCase();
   if (query && !String(entry.line || '').toLowerCase().includes(query)) return false;
   return true;
