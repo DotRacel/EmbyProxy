@@ -12,8 +12,18 @@ import (
 )
 
 const (
+	// streamResumeMaxAttempts bounds consecutive resumes that deliver nothing new.
+	// It is deliberately not a budget for the whole response: a multi-hour transfer
+	// may legitimately need to resume many times, and counting those against a
+	// lifetime cap aborts long playbacks that were otherwise making progress.
 	streamResumeMaxAttempts = 2
-	streamResumeDrainLimit  = 256 * 1024
+	// streamResumeMaxTotalAttempts is an absolute ceiling so an upstream that
+	// resumes, yields a trickle of bytes and drops again cannot loop indefinitely.
+	streamResumeMaxTotalAttempts = 64
+	// streamResumeProgressBytes is how much a resume must deliver before it counts
+	// as progress and clears the consecutive-failure budget.
+	streamResumeProgressBytes = 64 * 1024
+	streamResumeDrainLimit    = 256 * 1024
 )
 
 type upstreamClientContextKey struct{}
@@ -34,11 +44,27 @@ type streamResumeValidator struct {
 }
 
 type streamResumeProgress struct {
-	attempts     int
-	resumedBytes int64
-	firstFrom    int64
-	err          error
-	resumeErr    bool
+	attempts       int
+	consecutive    int
+	lastProgressAt int64
+	resumedBytes   int64
+	firstFrom      int64
+	err            error
+	resumeErr      bool
+}
+
+// noteProgress clears the consecutive-failure budget once a resume has delivered
+// a meaningful amount of fresh data, so the cap only ever fires on a stream that
+// is genuinely stuck rather than on one that has simply been running a long time.
+func (p *streamResumeProgress) noteProgress(sentBytes int64) {
+	if sentBytes-p.lastProgressAt >= streamResumeProgressBytes {
+		p.lastProgressAt = sentBytes
+		p.consecutive = 0
+	}
+}
+
+func (p *streamResumeProgress) exhausted() bool {
+	return p.consecutive >= streamResumeMaxAttempts || p.attempts >= streamResumeMaxTotalAttempts
 }
 
 func attachUpstreamClient(res *http.Response, client *http.Client) {
@@ -209,7 +235,8 @@ func (h *Handler) copyResponseBodyWithResume(w http.ResponseWriter, r *http.Requ
 			readErr = chunkReadErr
 			break
 		}
-		if progress.attempts >= streamResumeMaxAttempts {
+		progress.noteProgress(sentBytes)
+		if progress.exhausted() {
 			progress.err = fmt.Errorf("stream resume attempts exhausted: %w", chunkReadErr)
 			progress.resumeErr = true
 			closeResponseBody(current)
@@ -222,6 +249,7 @@ func (h *Handler) copyResponseBodyWithResume(w http.ResponseWriter, r *http.Requ
 			progress.firstFrom = nextStart
 		}
 		progress.attempts++
+		progress.consecutive++
 		nextResp, err := h.resumeStreamResponse(current, plan, nextStart)
 		drainAndCloseResponseBody(current)
 		if err != nil {

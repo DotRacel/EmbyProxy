@@ -1521,7 +1521,22 @@ func retryableStatusLogFields(res *http.Response, fields map[string]any) map[str
 	return fields
 }
 
+// recordUpstreamProto records the negotiated upstream protocol on the access log
+// so it reaches both upstreamReady and requestFinished. HTTP/2 multiplexes every
+// stream to a host onto a single connection, so a connection-level failure there
+// is not scoped to one playback the way an HTTP/1.1 failure is; telling the two
+// apart matters when diagnosing interrupted streams.
+func recordUpstreamProto(ctx context.Context, res *http.Response) {
+	if ctx == nil || res == nil {
+		return
+	}
+	if proto := strings.TrimSpace(res.Proto); proto != "" {
+		SetAccessLogField(ctx, "proto", proto)
+	}
+}
+
 func responseReadyLogFields(ctx context.Context, res *http.Response, fields map[string]any) map[string]any {
+	recordUpstreamProto(ctx, res)
 	fields = withAccessLogFields(ctx, fields)
 	fields = withRedirectLocationLogField(res, fields)
 	return foldActualTargetLogField(fields, responseLogTarget(res))

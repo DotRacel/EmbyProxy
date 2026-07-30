@@ -307,7 +307,7 @@ func TestProxyRequestLogsClientUpstreamAndFinishLifecycle(t *testing.T) {
 		{"event=requestStarted", "[access]", "node=node", "range=\"bytes=0-\""},
 		{"event=upstreamReady", "[proxy]", "node=node", "range=\"bytes=0-\"", "contentRange=\"bytes 0-4/5\""},
 		{"event=streamResumeDisabled", "[proxy]", "reason=not-media"},
-		{"event=requestFinished", "[access]", "range=\"bytes=0-\"", "contentRange=\"bytes 0-4/5\"", "streamResumeDisabled=not-media"},
+		{"event=requestFinished", "[access]", "range=\"bytes=0-\"", "contentRange=\"bytes 0-4/5\"", "streamResumeDisabled=not-media", "proto=HTTP/1.1"},
 	}
 	for i, wantParts := range wants {
 		for _, want := range wantParts {
