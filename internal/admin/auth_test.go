@@ -462,7 +462,9 @@ func TestAdminIndexLoginGuards(t *testing.T) {
 		t.Fatal("indexHTML is missing the authentication generation")
 	}
 	restoreBlock := indexFunctionBlock(t, `async function restoreSession()`, "\n}\n\nasync function doLogin")
-	loginBlock := indexFunctionBlock(t, `async function doLogin()`, "\n}\n\ndocument.getElementById('tokenInput')")
+	// 回车提交的监听已经统一挪到脚本末尾的「全局初始化」一节（原来 app 侧和登录侧各绑一次，会重复触发），
+	// 所以这里的结束锚点改成紧随其后的 doLogout。
+	loginBlock := indexFunctionBlock(t, `async function doLogin()`, "\n}\n\nasync function doLogout")
 
 	t.Run("stale session restoration", func(t *testing.T) {
 		assertContainsAll(t, restoreBlock, `const generation = ++authGeneration;`, `if (auto.ok)`)
@@ -550,7 +552,8 @@ func TestAdminIndexIgnoresClosedTwoFactorResponses(t *testing.T) {
 		t.Fatalf("submitTwoFactorReauth() does not accept the rotated disable session before the modal guard:\n%s", submitBlock)
 	}
 
-	confirmBlock := indexFunctionBlock(t, `async function confirmTwoFactorSetup()`, "\n}\n\nasync function openConfigModal")
+	// confirmTwoFactorSetup 现在是脚本里最后一个函数，后面直接是「全局初始化」一节。
+	confirmBlock := indexFunctionBlock(t, `async function confirmTwoFactorSetup()`, "\n * 全局初始化")
 	if !strings.Contains(confirmBlock, `button.disabled = true;`) || !strings.Contains(confirmBlock, `flowGeneration !== twoFactorFlowGeneration`) {
 		t.Fatalf("confirmTwoFactorSetup() does not serialize or invalidate confirmation:\n%s", confirmBlock)
 	}

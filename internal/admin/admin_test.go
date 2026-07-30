@@ -630,6 +630,113 @@ func TestConfigSetImageSettings(t *testing.T) {
 	}
 }
 
+func TestConfigSetLogHistorySettings(t *testing.T) {
+	tests := []struct {
+		name        string
+		setup       func(*testing.T, context.Context, *Handler)
+		payload     map[string]any
+		wantErr     string
+		wantEntries int
+		wantFiles   int
+	}{
+		{
+			name:        "defaults when omitted",
+			payload:     map[string]any{"logLevel": "info"},
+			wantEntries: storage.DefaultLogHistoryEntriesPerFile,
+			wantFiles:   storage.DefaultLogHistoryMaxFiles,
+		},
+		{
+			name:        "saves explicit values",
+			payload:     map[string]any{"logHistoryEntriesPerFile": 5000, "logHistoryMaxFiles": 8},
+			wantEntries: 5000,
+			wantFiles:   8,
+		},
+		{
+			name: "preserves saved values when omitted",
+			setup: func(t *testing.T, ctx context.Context, handler *Handler) {
+				t.Helper()
+				saved := storage.DefaultSystemConfig()
+				saved.LogHistoryEntriesPerFile = 800
+				saved.LogHistoryMaxFiles = 3
+				if err := handler.store.SaveSystemConfig(ctx, saved); err != nil {
+					t.Fatalf("SaveSystemConfig() error = %v", err)
+				}
+			},
+			payload:     map[string]any{"logLevel": "debug"},
+			wantEntries: 800,
+			wantFiles:   3,
+		},
+		{
+			name: "falls back to defaults for legacy config without the fields",
+			setup: func(t *testing.T, ctx context.Context, handler *Handler) {
+				t.Helper()
+				legacy := map[string]any{"logLevel": "info", "logAccess": true}
+				if err := handler.store.KV().Put(ctx, "system:config", legacy); err != nil {
+					t.Fatalf("Put() error = %v", err)
+				}
+			},
+			payload:     map[string]any{"logLevel": "warn"},
+			wantEntries: storage.DefaultLogHistoryEntriesPerFile,
+			wantFiles:   storage.DefaultLogHistoryMaxFiles,
+		},
+		{
+			name:    "rejects too small entries per file",
+			payload: map[string]any{"logHistoryEntriesPerFile": 100},
+			wantErr: "单个日志文件条数必须在 200-100000 之间",
+		},
+		{
+			name:    "rejects too large entries per file",
+			payload: map[string]any{"logHistoryEntriesPerFile": 100001},
+			wantErr: "单个日志文件条数必须在 200-100000 之间",
+		},
+		{
+			name:    "rejects zero max files",
+			payload: map[string]any{"logHistoryMaxFiles": 0},
+			wantErr: "日志保留文件数必须在 1-200 之间",
+		},
+		{
+			name:    "rejects too many max files",
+			payload: map[string]any{"logHistoryMaxFiles": 201},
+			wantErr: "日志保留文件数必须在 1-200 之间",
+		},
+		{
+			name:    "rejects non integer input",
+			payload: map[string]any{"logHistoryMaxFiles": "abc"},
+			wantErr: "日志保留文件数必须是整数，取值范围 1-200",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			handler, closeStore := newConfigTestHandler(t)
+			defer closeStore()
+			if tt.setup != nil {
+				tt.setup(t, ctx, handler)
+			}
+
+			res := handler.configSet(ctx, map[string]any{"config": tt.payload})
+			if tt.wantErr != "" {
+				if res["ok"] == true || res["error"] != tt.wantErr {
+					t.Fatalf("configSet() = %+v, want error %q", res, tt.wantErr)
+				}
+				return
+			}
+			if res["ok"] != true {
+				t.Fatalf("configSet() = %+v", res)
+			}
+			got, err := handler.store.GetSystemConfig(ctx, storage.DefaultSystemConfig())
+			if err != nil {
+				t.Fatalf("GetSystemConfig() error = %v", err)
+			}
+			if got.LogHistoryEntriesPerFile != tt.wantEntries || got.LogHistoryMaxFiles != tt.wantFiles {
+				t.Fatalf("log history = %d entries x %d files, want %d x %d",
+					got.LogHistoryEntriesPerFile, got.LogHistoryMaxFiles, tt.wantEntries, tt.wantFiles)
+			}
+		})
+	}
+}
+
 func assertImageConfig(t *testing.T, got, want storage.SystemConfig) {
 	t.Helper()
 	if want.LogLevel != "" && got.LogLevel != want.LogLevel {
