@@ -16,59 +16,29 @@ EmbyProxy 是一个用于管理和转发 Emby 节点请求的代理程序，提�
 - **按节点独立策略**：每个 Emby 节点都可以单独设置是否伪装客户端、是否启用直连访问、保号提醒周期等策略，便于针对不同服务器做差异化配置。
 - **Telegram 保号通知**：可为节点配置保号周期、提前提醒时间和通知频率，通过 Telegram 推送保号提醒，减少忘记维护账号的风险。
 - **Web 可视化运维**：节点维护、批量迁移、收藏排序、在线检测和播放统计都集中在管理面板中，多服务器维护更直观。
-- **轻量本地部署**：Go 单程序运行，使用 SQLite 保存配置和统计数据，支持 Windows、Linux 多架构二进制包和 Docker Compose 部署。
+- **轻量本地部署**：Go 单程序运行，使用 SQLite 保存配置和统计数据，通过 Docker Compose 部署，镜像支持 amd64 和 arm64。
 - **访问安全控制**：管理界面和管理 API 使用 `ADMIN_TOKEN` 保护，并可通过二维码绑定 TOTP 双重验证；节点也可配置独立密钥。
-
-## 程序下载和使用
-
-打开 Release 页面下载对应系统的压缩包：
-
-[https://github.com/hkfires/EmbyProxy/releases/latest](https://github.com/hkfires/EmbyProxy/releases/latest)
-
-可用文件：
-
-| 系统 | 架构 | 文件 |
-| --- | --- | --- |
-| Windows | x64 | `embyproxy-windows-x64.zip` |
-| Windows | x86 | `embyproxy-windows-x86.zip` |
-| Windows | ARM64 | `embyproxy-windows-arm64.zip` |
-| Linux | x64 | `embyproxy-linux-x64.tar.gz` |
-| Linux | x86 | `embyproxy-linux-x86.tar.gz` |
-| Linux | ARM64 | `embyproxy-linux-arm64.tar.gz` |
-| Linux | ARMv7 | `embyproxy-linux-armv7.tar.gz` |
-
-压缩包内包含程序文件和 `.env.example` 配置模板。解压后先复制一份配置文件：
-
-```text
-.env.example -> .env
-```
-
-然后打开 `.env`，把 `ADMIN_TOKEN` 改成自己的管理密钥：
-
-```env
-ADMIN_TOKEN=请改成足够长的随机字符串
-```
-
-`ADMIN_TOKEN` 用于登录管理界面和访问管理 API，请不要继续使用默认值。程序默认监听 `8787` 端口，只有需要改端口时才设置 `PORT`。
-
-查看当前程序版本：
-
-```text
-embyproxy --version
-```
 
 ## Docker Compose
 
-Docker Compose 部署只需要下载 `compose.yml` 和 `.env.example`，并将两个文件放在同一个目录下：
+本项目只发布 Docker 镜像，镜像地址：
 
-- [`compose.yml`](https://raw.githubusercontent.com/hkfires/EmbyProxy/main/compose.yml)
-- [`.env.example`](https://raw.githubusercontent.com/hkfires/EmbyProxy/main/.env.example)
+[https://github.com/DotRacel/EmbyProxy/pkgs/container/embyproxy](https://github.com/DotRacel/EmbyProxy/pkgs/container/embyproxy)
+
+支持 `linux/amd64` 和 `linux/arm64`。每个版本 tag 都会推送同名镜像，正式版同时更新 `latest`。
+
+部署只需要下载 `compose.yml` 和 `.env.example`，并将两个文件放在同一个目录下：
+
+- [`compose.yml`](https://raw.githubusercontent.com/DotRacel/EmbyProxy/main/compose.yml)
+- [`.env.example`](https://raw.githubusercontent.com/DotRacel/EmbyProxy/main/.env.example)
 
 `compose.yml` 默认使用远程镜像：
 
 ```yaml
-image: ghcr.io/hkfires/embyproxy:latest
+image: ghcr.io/dotracel/embyproxy:latest
 ```
+
+需要固定版本时改成具体 tag，例如 `ghcr.io/dotracel/embyproxy:v1.1.0`。
 
 使用前先将 `.env.example` 复制为 `.env`，然后用文本编辑器打开 `.env`。
 
@@ -89,6 +59,12 @@ docker compose up -d
 ```bash
 docker compose pull
 docker compose up -d
+```
+
+查看当前程序版本：
+
+```bash
+docker compose exec app /app/embyproxy --version
 ```
 
 ## 配置

@@ -1,6 +1,6 @@
 services:
   app:
-    image: ${EMBYPROXY_IMAGE:-ghcr.io/hkfires/embyproxy:latest}
+    image: ${EMBYPROXY_IMAGE:-ghcr.io/dotracel/embyproxy:latest}
     pull_policy: always
     build:
       context: .
