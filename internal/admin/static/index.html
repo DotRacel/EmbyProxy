@@ -2559,7 +2559,8 @@ button:disabled {
               <div id="statsChart" class="chart-slot">
                 <div class="empty-state is-slim"><span>暂无播放数据</span></div>
               </div>
-              <div class="chart-legend">
+              <!-- 图例只在真正画出折线时显示，由 renderStatsChart 控制 -->
+              <div class="chart-legend" id="statsChartLegend" hidden>
                 <span class="legend-item"><span class="legend-line legend-line-accent" aria-hidden="true"></span>播放次数</span>
                 <span class="legend-item"><span class="legend-line legend-line-dashed" aria-hidden="true"></span>出站流量</span>
               </div>
@@ -3466,7 +3467,10 @@ document.addEventListener('click', e => {
  * ============================================================ */
 
 function esc(s) {
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  // 注意不能写 String(s||'')：那样数字 0 和 false 会被当成空值渲染成空白，
+  // 统计表格的「播放次数 0」「会话数 0」就是这么变成空单元格的。
+  return (s === null || s === undefined ? '' : String(s))
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function attr(s) {
@@ -5163,7 +5167,10 @@ function renderStatsChart() {
     buckets.set(day, bucket);
   }
   const days = [...buckets.values()].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+  const legendEl = document.getElementById('statsChartLegend');
+  const showLegend = show => { if (legendEl) legendEl.hidden = !show; };
   if (!days.length) {
+    showLegend(false);
     el.innerHTML = '<div class="empty-state is-slim"><span>暂无数据</span></div>';
     if (rangeEl) rangeEl.textContent = '';
     return;
@@ -5174,7 +5181,20 @@ function renderStatsChart() {
     rangeEl.textContent = days.length > 1 ? `${head} → ${tail}` : head;
   }
 
-  const points = days.length === 1 ? [days[0], days[0]] : days;
+  // 只有一天数据画不出趋势：复制成两点后是一条贴着画布边缘的水平线，
+  // 播放次数为 0 时压在底边、出站流量顶到顶边，看起来像坏掉了。直接给结论式摘要。
+  if (days.length < 2) {
+    showLegend(false);
+    const only = days[0];
+    el.innerHTML = `<div class="empty-state is-slim">
+      <span>${esc(only.day)} · 播放 ${esc(only.plays)} 次 · 出站 ${esc(formatBytes(only.outbound))}</span>
+      <span class="text-muted" style="font-size:11.5px">至少两天数据才能画出趋势</span>
+    </div>`;
+    return;
+  }
+
+  showLegend(true);
+  const points = days;
   const width = 660, height = 180, padTop = 16, padBottom = 22;
   const maxPlays = Math.max(1, ...points.map(p => p.plays));
   const maxOutbound = Math.max(1, ...points.map(p => p.outbound));
