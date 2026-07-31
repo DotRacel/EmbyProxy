@@ -2302,6 +2302,12 @@ select.input {
 button:disabled {
   cursor: not-allowed;
 }
+
+/* 统计页是「可滚动的 flex 列容器」，子项默认 flex-shrink:1 —— 内容超出视口高度时，
+   flex 会先把所有子项压扁再考虑滚动。KPI 网格本身是 overflow:hidden，被压扁后
+   标签行直接被裁掉，看起来就像被下面的图表块盖住了一半（右侧栏内容越多越明显）。
+   子项一律不参与收缩，交给容器自己滚。 */
+.stats-pane > * { flex-shrink: 0; }
 </style>
 </head>
 <body>
@@ -2531,7 +2537,7 @@ button:disabled {
           <div class="stats-split">
             <section class="stats-chart-block">
               <div class="block-head">
-                <h6>每日播放与流量</h6>
+                <h6 id="statsChartTitle">每日播放与流量</h6>
                 <span class="mono block-head-meta" id="statsChartRange"></span>
               </div>
               <div id="statsChart" class="chart-slot">
@@ -5046,6 +5052,8 @@ function renderStatsChart() {
     buckets.set(day, bucket);
   }
   const days = [...buckets.values()].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+  const titleEl = document.getElementById('statsChartTitle');
+  if (titleEl) titleEl.textContent = statsRangeDays() <= 1 ? '今日播放与流量' : '每日播放与流量';
   const legendEl = document.getElementById('statsChartLegend');
   const showLegend = show => { if (legendEl) legendEl.hidden = !show; };
   if (!days.length) {
@@ -5062,12 +5070,20 @@ function renderStatsChart() {
 
   // 只有一天数据画不出趋势：复制成两点后是一条贴着画布边缘的水平线，
   // 播放次数为 0 时压在底边、出站流量顶到顶边，看起来像坏掉了。直接给结论式摘要。
+  //
+  // 提示语要分清两种情况：选「今天」时本来就只可能有一天，说「至少两天数据」
+  // 等于把用户主动选的范围说成数据缺失；只有在多天范围里恰好只落到一天时，
+  // 那才真的是数据不够。
   if (days.length < 2) {
     showLegend(false);
     const only = days[0];
+    const singleDayRange = statsRangeDays() <= 1;
+    const hint = singleDayRange
+      ? '趋势需要跨天对比，切换到「近 7 天」查看'
+      : '所选范围内只有一天有数据，画不出趋势';
     el.innerHTML = `<div class="empty-state is-slim">
       <span>${esc(only.day)} · 播放 ${esc(only.plays)} 次 · 出站 ${esc(formatBytes(only.outbound))}</span>
-      <span class="text-muted" style="font-size:11.5px">至少两天数据才能画出趋势</span>
+      <span class="text-muted" style="font-size:11.5px">${esc(hint)}</span>
     </div>`;
     return;
   }
