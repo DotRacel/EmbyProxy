@@ -1,5 +1,6 @@
 // Package probe 周期性探测各 Emby 节点的上游线路，把延迟与可达性样本保存在内存里，
-// 供管理面板绘制延迟曲线、迷你走势图和 24 小时可用率。样本不落库，重启后从零开始。
+// 供管理面板绘制延迟曲线、迷你走势图和 24 小时可用率。样本同时落到 SQLite 的
+// probe_samples 表，进程启动时回填最近 Retention 窗口，重启后曲线不会归零。
 package probe
 
 import (
@@ -147,6 +148,22 @@ func (r *Registry) RecordTarget(node, target string, v Sample) {
 		byTarget[target] = s
 	}
 	s.push(v)
+}
+
+// Restore 把落库的样本回填进内存序列。samples 必须按时间升序，通常来自
+// storage.LoadProbeSamples。Target 为空的记录是节点整体样本。
+func (r *Registry) Restore(samples []storage.ProbeSample) {
+	if r == nil || len(samples) == 0 {
+		return
+	}
+	for _, s := range samples {
+		v := Sample{At: s.At, MS: s.MS, Status: s.Status, OK: s.OK, Err: s.Err}
+		if s.Target == "" {
+			r.RecordNode(s.Node, v)
+			continue
+		}
+		r.RecordTarget(s.Node, s.Target, v)
+	}
 }
 
 // Retain 丢弃已经不存在的节点的样本，避免删除或改名后一直占着内存。
@@ -358,6 +375,7 @@ func (p *Prober) Start(ctx context.Context) {
 		return
 	}
 	go func() {
+		p.Restore(ctx)
 		p.ProbeAll(ctx)
 		ticker := time.NewTicker(Interval)
 		defer ticker.Stop()
@@ -372,7 +390,25 @@ func (p *Prober) Start(ctx context.Context) {
 	}()
 }
 
-// ProbeAll 探测全部节点，并清掉已删除节点的历史样本。
+// Restore 从库里回填最近 Retention 窗口的样本，让重启后的面板不用等采样重新跑满。
+func (p *Prober) Restore(ctx context.Context) {
+	if p == nil || p.registry == nil || p.store == nil {
+		return
+	}
+	samples, err := p.store.LoadProbeSamples(ctx, Retention)
+	if err != nil {
+		if p.log != nil {
+			p.log.Debug("probe", "restore samples failed", map[string]any{"event": "probeRestoreFailed", "error": err.Error()})
+		}
+		return
+	}
+	p.registry.Restore(samples)
+	if p.log != nil && len(samples) > 0 {
+		p.log.Info("probe", "probe samples restored", map[string]any{"event": "probeSamplesRestored", "samples": len(samples)})
+	}
+}
+
+// ProbeAll 探测全部节点，并清掉已删除节点的历史样本。一轮采样的样本合并成一次写库。
 func (p *Prober) ProbeAll(ctx context.Context) {
 	if p == nil || p.store == nil {
 		return
@@ -389,28 +425,61 @@ func (p *Prober) ProbeAll(ctx context.Context) {
 		names = append(names, node.Name)
 	}
 	p.registry.Retain(names)
+	if err := p.store.RetainProbeSamples(ctx, names); err != nil && p.log != nil {
+		p.log.Debug("probe", "retain samples failed", map[string]any{"event": "probeRetainFailed", "error": err.Error()})
+	}
+	if err := p.store.PruneProbeSamples(ctx, Retention); err != nil && p.log != nil {
+		p.log.Debug("probe", "prune samples failed", map[string]any{"event": "probePruneFailed", "error": err.Error()})
+	}
+
+	batch := []storage.ProbeSample{}
 	for _, node := range nodes {
 		select {
 		case <-ctx.Done():
+			p.persist(ctx, batch)
 			return
 		default:
 		}
-		p.ProbeNode(ctx, node)
+		_, samples := p.probeNode(ctx, node)
+		batch = append(batch, samples...)
+	}
+	p.persist(ctx, batch)
+}
+
+// persist 把一批样本写库。写失败只记日志：内存里的曲线仍然可用，下一轮还会再写。
+func (p *Prober) persist(ctx context.Context, samples []storage.ProbeSample) {
+	if p == nil || p.store == nil || len(samples) == 0 {
+		return
+	}
+	// 探测轮次可能因为 ctx 取消而中断，这里用独立 ctx，别把已经拿到的样本丢掉。
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := p.store.AppendProbeSamples(writeCtx, samples); err != nil && p.log != nil {
+		p.log.Debug("probe", "persist samples failed", map[string]any{"event": "probePersistFailed", "error": err.Error()})
 	}
 }
 
-// ProbeNode 依次探测节点的每条上游线路，并把「第一条可用线路」记为节点整体状态，
-// 与代理实际的故障转移顺序保持一致。
+// ProbeNode 探测单个节点并立即落库，供面板上的手动「检测」按钮调用。
 func (p *Prober) ProbeNode(ctx context.Context, node storage.Node) Sample {
+	sample, samples := p.probeNode(ctx, node)
+	p.persist(ctx, samples)
+	return sample
+}
+
+// probeNode 依次探测节点的每条上游线路，并把「第一条可用线路」记为节点整体状态，
+// 与代理实际的故障转移顺序保持一致。第二个返回值是这一轮待落库的样本。
+func (p *Prober) probeNode(ctx context.Context, node storage.Node) (Sample, []storage.ProbeSample) {
 	targets := storage.SplitTargets(node.Target)
 	if len(targets) > targetLimit {
 		targets = targets[:targetLimit]
 	}
 	var nodeSample Sample
 	found := false
+	rows := make([]storage.ProbeSample, 0, len(targets)+1)
 	for _, target := range targets {
 		sample := p.probeTarget(ctx, target)
 		p.registry.RecordTarget(node.Name, target, sample)
+		rows = append(rows, storeSample(node.Name, target, sample))
 		if !found && sample.OK {
 			nodeSample = sample
 			found = true
@@ -423,7 +492,20 @@ func (p *Prober) ProbeNode(ctx context.Context, node storage.Node) Sample {
 		nodeSample = Sample{At: time.Now().UnixMilli(), MS: 0, Err: "未配置上游地址"}
 	}
 	p.registry.RecordNode(node.Name, nodeSample)
-	return nodeSample
+	rows = append(rows, storeSample(node.Name, "", nodeSample))
+	return nodeSample, rows
+}
+
+func storeSample(node, target string, v Sample) storage.ProbeSample {
+	return storage.ProbeSample{
+		Node:   node,
+		Target: target,
+		At:     v.At,
+		MS:     v.MS,
+		Status: v.Status,
+		OK:     v.OK,
+		Err:    v.Err,
+	}
 }
 
 func (p *Prober) probeTarget(ctx context.Context, target string) Sample {

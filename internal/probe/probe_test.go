@@ -4,8 +4,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"embyproxy/internal/storage"
 )
 
 func TestRegistryStatsSummarizesLatestSampleAndAvailability(t *testing.T) {
@@ -172,5 +175,73 @@ func TestErrorTextCompressesCommonNetworkFailures(t *testing.T) {
 	}
 	if errorText(nil) != "" {
 		t.Error("errorText(nil) should be empty")
+	}
+}
+
+func TestProbeAllPersistsSamplesAndRestoreRebuildsSeries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx := t.Context()
+	store, err := storage.New(filepath.Join(t.TempDir(), "probe.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.SaveNode(ctx, "admin", storage.Node{Name: "uhdnow", Target: server.URL}); err != nil {
+		t.Fatal(err)
+	}
+
+	NewProber(NewRegistry(), store, nil).ProbeAll(ctx)
+
+	samples, err := store.LoadProbeSamples(ctx, Retention)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 一条上游线路 → 一条线路样本 + 一条节点整体样本。
+	if len(samples) != 2 {
+		t.Fatalf("persisted samples = %d, want 2: %+v", len(samples), samples)
+	}
+
+	// 新进程从零开始，回填后详情页的曲线与上游线路延迟应立刻可用。
+	fresh := NewProber(NewRegistry(), store, nil)
+	fresh.Restore(ctx)
+	stats := fresh.registry.Stats("uhdnow", []string{server.URL})
+	if !stats.Probed || !stats.OK || stats.Samples != 1 {
+		t.Fatalf("restored stats = %+v, want 1 ok sample", stats)
+	}
+	if len(stats.Targets) != 1 || !stats.Targets[0].OK || stats.Targets[0].Samples != 1 {
+		t.Fatalf("restored targets = %+v", stats.Targets)
+	}
+}
+
+func TestProbeAllDropsSamplesOfRemovedNodes(t *testing.T) {
+	ctx := t.Context()
+	store, err := storage.New(filepath.Join(t.TempDir(), "probe.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.SaveNode(ctx, "admin", storage.Node{Name: "kept", Target: "http://127.0.0.1:1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendProbeSamples(ctx, []storage.ProbeSample{
+		{Node: "removed", At: time.Now().UnixMilli() - 1000, MS: 100, OK: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	NewProber(NewRegistry(), store, nil).ProbeAll(ctx)
+
+	samples, err := store.LoadProbeSamples(ctx, Retention)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range samples {
+		if s.Node == "removed" {
+			t.Fatalf("removed node still has samples: %+v", samples)
+		}
 	}
 }

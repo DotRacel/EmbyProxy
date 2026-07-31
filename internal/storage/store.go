@@ -151,6 +151,17 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			updated_at INTEGER NOT NULL,
 			PRIMARY KEY(day, node, client)
 		);
+		CREATE TABLE IF NOT EXISTS probe_samples (
+			node TEXT NOT NULL,
+			target TEXT NOT NULL DEFAULT '',
+			at INTEGER NOT NULL,
+			ms INTEGER NOT NULL DEFAULT 0,
+			status INTEGER NOT NULL DEFAULT 0,
+			ok INTEGER NOT NULL DEFAULT 0,
+			err TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(node, target, at)
+		);
+		CREATE INDEX IF NOT EXISTS idx_probe_samples_at ON probe_samples(at);
 		CREATE TABLE IF NOT EXISTS play_buckets (
 			bucket_start INTEGER NOT NULL,
 			node TEXT NOT NULL,
