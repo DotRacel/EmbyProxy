@@ -104,11 +104,11 @@ func New(cfg config.Config, store *storage.Store, ids *identity.Manager, log *lo
 		imageCache:                newImageCacheFromSystemConfig(cfg, defaults),
 		activeTarget:              map[string]string{},
 		noRedirectClient:          newProxyHTTPClient(false),
-		defaultFollowClient:       newProxyHTTPClient(true),
-		playbackActionClient:      newProxyHTTPClientWithTransport(true, playbackActionTransport),
-		playbackStreamClient:      newProxyHTTPClientWithTransport(true, playbackStreamTransport),
+		defaultFollowClient:       withRedirectScreen(newProxyHTTPClient(true)),
+		playbackActionClient:      withRedirectScreen(newProxyHTTPClientWithTransport(true, playbackActionTransport)),
+		playbackStreamClient:      withRedirectScreen(newProxyHTTPClientWithTransport(true, playbackStreamTransport)),
 		playbackStreamProbeClient: newProxyHTTPClientWithTransport(false, playbackStreamTransport),
-		imageFollowClient:         newProxyHTTPClient(true),
+		imageFollowClient:         withRedirectScreen(newProxyHTTPClient(true)),
 		rawDirectClient:           newRawHTTPClient(),
 		rawLinkKey:                newRawLinkKey(cfg.AdminToken),
 	}
@@ -129,6 +129,35 @@ func newProxyHTTPClientWithTransport(follow bool, transport http.RoundTripper) *
 		}
 	}
 	return client
+}
+
+// withRedirectScreen installs SSRF screening on a follow-redirect client. These
+// clients dial through the unprotected transport, so an upstream 3xx whose
+// Location points at a private/link-local target (e.g. http://169.254.169.254/)
+// would otherwise be dialed straight through, bypassing the rawIPBlocked guard
+// that only the protected direct/raw path enforces.
+func withRedirectScreen(client *http.Client) *http.Client {
+	if client != nil {
+		client.CheckRedirect = screenFollowRedirect
+	}
+	return client
+}
+
+// screenFollowRedirect rejects any redirect hop whose new target host resolves to
+// a blocked internal address, reusing the same rawHostBlocked helper the direct
+// path uses. Setting CheckRedirect removes Go's built-in 10-redirect cap, so the
+// cap is reinstated here to keep the follow clients from looping indefinitely.
+func screenFollowRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errTooManyRedirects
+	}
+	if req == nil || req.URL == nil {
+		return nil
+	}
+	if rawHostBlocked(req.Context(), req.URL.Hostname()) {
+		return fmt.Errorf("blocked redirect to internal host: %s", req.URL.Hostname())
+	}
+	return nil
 }
 
 func newRawHTTPClient() *http.Client {
@@ -322,6 +351,8 @@ func (h *Handler) CleanupTTLMaps() {
 	if h.store != nil {
 		_ = h.store.PrunePlayBuckets(context.Background(), 3)
 		_ = h.store.PrunePlaybackStates(context.Background(), 24*time.Hour)
+		_ = h.store.PrunePlaySessions(context.Background(), 30*24*time.Hour)
+		_ = h.store.PrunePlayEvents(context.Background(), 30*24*time.Hour)
 	}
 }
 
@@ -1292,16 +1323,42 @@ func (h *Handler) rawHostAllowed(ctx context.Context, node storage.Node, rawURL 
 }
 
 func (h *Handler) rawHostAllowedFor(ctx context.Context, node storage.Node, rawURL *url.URL, env config.ProxyEnv, bypassExternalAuth bool) bool {
+	// The private/internal block is unconditional: it holds for admin-configured
+	// external hosts, for unsigned /__raw__/host attempts, and for proxy-signed
+	// trusted links alike, so no path can be steered onto an RFC1918/link-local
+	// target.
 	if rawURL == nil || rawHostBlocked(ctx, rawURL.Hostname()) {
 		return false
-	}
-	if bypassExternalAuth {
-		return true
 	}
 	if env.ExternalAllowAny {
 		return true
 	}
+	if bypassExternalAuth {
+		// A valid HMAC-signed /__raw__ link is trusted because the proxy minted it.
+		// But the proxy auto-mints such links for arbitrary http(s) URLs found in
+		// upstream response bodies, so an unconditional bypass turns any signed link
+		// into an open relay to any public host. Once an admin has narrowed external
+		// egress by configuring a whitelist, honor that intent for trusted links too:
+		// the host must still fall inside the node's own targets or the whitelist.
+		// With no whitelist configured we preserve the historical bypass so existing
+		// direct-stream deployments (CDN hosts that are not whitelisted) keep working.
+		if externalWhitelistConfigured(env) {
+			return externalHostAllowed(node, env, rawURL.Host)
+		}
+		return true
+	}
 	return externalHostAllowed(node, env, rawURL.Host)
+}
+
+// externalWhitelistConfigured reports whether the admin has entered any external
+// allow-host entry. ExternalAllowAny is handled separately by the caller.
+func externalWhitelistConfigured(env config.ProxyEnv) bool {
+	for _, item := range strings.Split(env.ExternalAllowHosts, ",") {
+		if strings.TrimSpace(item) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // externalHostAllowed matches host against the node's own targets plus the
@@ -1759,5 +1816,7 @@ func isRetryableProtocolStatus(status int) bool {
 }
 
 var errNoResponse = errors.New("no response")
+
+var errTooManyRedirects = errors.New("stopped after 10 redirects")
 
 var errRequestBodyConsumed = errors.New("request body already streamed upstream")

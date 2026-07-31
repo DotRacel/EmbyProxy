@@ -379,7 +379,12 @@ func (s *Store) LogPlaybackTraffic(ctx context.Context, in PlaybackInput) error 
 	if client == "" {
 		client = "Unknown"
 	}
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO play_stats (day, node, client, plays, bytes, inbound_bytes, outbound_bytes, sessions, errors, updated_at)
 		VALUES (?, ?, ?, 0, ?, ?, ?, 0, 0, ?)
 		ON CONFLICT(day, node, client) DO UPDATE SET
@@ -387,11 +392,13 @@ func (s *Store) LogPlaybackTraffic(ctx context.Context, in PlaybackInput) error 
 			inbound_bytes = inbound_bytes + excluded.inbound_bytes,
 			outbound_bytes = outbound_bytes + excluded.outbound_bytes,
 			updated_at = MAX(play_stats.updated_at, excluded.updated_at)
-	`, day, nodeName, client, totalBytes, inboundBytes, outboundBytes, now)
-	if err != nil {
+	`, day, nodeName, client, totalBytes, inboundBytes, outboundBytes, now); err != nil {
 		return err
 	}
-	return upsertPlayBucket(ctx, s.db, now, nodeName, client, "proxy", 0, 0, totalBytes, inboundBytes, outboundBytes, 0, 0)
+	if err := upsertPlayBucket(ctx, tx, now, nodeName, client, "proxy", 0, 0, totalBytes, inboundBytes, outboundBytes, 0, 0); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func playbackOccurredAt(in PlaybackInput) int64 {
@@ -1009,6 +1016,24 @@ func (s *Store) PrunePlaybackStates(ctx context.Context, maxAge time.Duration) e
 	}
 	cutoff := time.Now().Add(-maxAge).UnixMilli()
 	_, err := s.db.ExecContext(ctx, `DELETE FROM playback_states WHERE updated_at < ?`, cutoff)
+	return err
+}
+
+func (s *Store) PrunePlaySessions(ctx context.Context, maxAge time.Duration) error {
+	if maxAge <= 0 {
+		maxAge = 30 * 24 * time.Hour
+	}
+	cutoff := time.Now().Add(-maxAge).UnixMilli()
+	_, err := s.db.ExecContext(ctx, `DELETE FROM play_sessions WHERE last_ts < ?`, cutoff)
+	return err
+}
+
+func (s *Store) PrunePlayEvents(ctx context.Context, maxAge time.Duration) error {
+	if maxAge <= 0 {
+		maxAge = 30 * 24 * time.Hour
+	}
+	cutoff := time.Now().Add(-maxAge).UnixMilli()
+	_, err := s.db.ExecContext(ctx, `DELETE FROM play_events WHERE last_ts < ?`, cutoff)
 	return err
 }
 

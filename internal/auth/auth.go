@@ -111,7 +111,7 @@ func (c *Checker) CheckWithStateGuard(r *http.Request) (Result, func()) {
 	if got == "" {
 		return Result{Status: http.StatusUnauthorized, Error: ErrorUnauthorized}, noOpRelease
 	}
-	failureKey := c.ClientIP(r)
+	failureKey := c.clientIPForLimit(r)
 	if SafeEqual(got, admin) {
 		if !c.clearFailureIfAllowed(&c.tokenFails, failureKey, adminTokenFailureLimit, authFailureWindow) {
 			return Result{Status: http.StatusTooManyRequests, Error: ErrorTooManyRequests}, noOpRelease
@@ -144,6 +144,10 @@ func (c *Checker) ClientIP(r *http.Request) string {
 		return "unknown"
 	}
 	return ClientIP(r, c.trustsProxy(r.Context()))
+}
+
+func (c *Checker) clientIPForLimit(r *http.Request) string {
+	return ClientIPForLimit(r, c.trustsProxy(r.Context()))
 }
 
 func (c *Checker) currentTime() time.Time {
@@ -301,6 +305,37 @@ func ClientIP(r *http.Request, trustProxy bool) string {
 		}
 		if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
 			return xr
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	if r.RemoteAddr != "" {
+		return r.RemoteAddr
+	}
+	return "unknown"
+}
+
+// ClientIPForLimit returns an identifier for brute-force / failure-lockout
+// keying that a client cannot forge. Unlike ClientIP (which trusts the
+// leftmost X-Forwarded-For entry for display/logging), when a proxy is
+// trusted this uses the RIGHTMOST XFF entry — the address the trusted proxy
+// actually observed and appended — falling back to the direct socket peer.
+// This prevents an attacker from rotating X-Forwarded-For to evade the login
+// and TOTP failure lockout.
+func ClientIPForLimit(r *http.Request, trustProxy bool) string {
+	if r == nil {
+		return "unknown"
+	}
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				if ip := strings.TrimSpace(parts[i]); ip != "" {
+					return ip
+				}
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

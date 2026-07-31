@@ -1079,8 +1079,21 @@ func TestNewHandlerSeparatesPlaybackConnectionPools(t *testing.T) {
 	if h.playbackStreamProbeClient.CheckRedirect == nil {
 		t.Fatal("playback stream probe client should disable automatic redirects")
 	}
-	if h.playbackActionClient.CheckRedirect != nil || h.playbackStreamClient.CheckRedirect != nil {
-		t.Fatal("playback action and stream clients should follow redirects")
+	// Playback action/stream clients follow redirects, but each hop is screened
+	// for SSRF (unlike the probe client, which disables redirects entirely).
+	// Literal IPs are used so the check needs no DNS.
+	for _, c := range []*http.Client{h.playbackActionClient, h.playbackStreamClient} {
+		if c.CheckRedirect == nil {
+			t.Fatal("playback action and stream clients should screen redirects")
+		}
+		pub, _ := http.NewRequest(http.MethodGet, "https://8.8.8.8/", nil)
+		if err := c.CheckRedirect(pub, nil); err != nil {
+			t.Fatalf("redirect to public host should be allowed: %v", err)
+		}
+		internal, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)
+		if err := c.CheckRedirect(internal, nil); err == nil {
+			t.Fatal("redirect to internal host should be blocked")
+		}
 	}
 }
 

@@ -212,7 +212,7 @@ func (c *Checker) ConfirmTwoFactorSetup(r *http.Request, sessionKey, setupID, co
 	if err := c.store.SaveAdmin2FAConfig(r.Context(), envelope); err != nil {
 		return Session{}, TwoFactorStatus{}, Result{Status: http.StatusInternalServerError, Error: "INTERNAL_ERROR"}
 	}
-	c.clearFailure(&c.totpFails, c.ClientIP(r))
+	c.clearFailure(&c.totpFails, c.clientIPForLimit(r))
 	c.replaceAllSessionsWith(session, sessionFamily)
 	status := TwoFactorStatus{
 		Configured:        true,
@@ -267,7 +267,7 @@ func (c *Checker) verifyAdminCredential(r *http.Request, token string) Result {
 	if errText := ValidateAdminToken(admin); errText != "" {
 		return Result{Status: http.StatusInternalServerError, Error: errText}
 	}
-	failureKey := c.ClientIP(r)
+	failureKey := c.clientIPForLimit(r)
 	if SafeEqual(strings.TrimSpace(token), admin) {
 		if !c.clearFailureIfAllowed(&c.tokenFails, failureKey, adminTokenFailureLimit, authFailureWindow) {
 			return Result{Status: http.StatusTooManyRequests, Error: ErrorTooManyRequests}
@@ -284,7 +284,7 @@ func (c *Checker) verifyStoredTOTP(r *http.Request, code string) Result {
 	if c.store == nil {
 		return Result{Status: http.StatusServiceUnavailable, Error: ErrorTwoFactorUnavailable}
 	}
-	failureKey := c.ClientIP(r)
+	failureKey := c.clientIPForLimit(r)
 	if c.failureLimited(&c.totpFails, failureKey, totpFailureLimit, authFailureWindow) {
 		return Result{Status: http.StatusTooManyRequests, Error: ErrorTooManyRequests}
 	}
@@ -332,7 +332,7 @@ func (c *Checker) validateTOTPCode(r *http.Request, secret, code string) (uint64
 	if code == "" {
 		return 0, Result{Status: http.StatusUnauthorized, Error: ErrorTOTPRequired}
 	}
-	failureKey := c.ClientIP(r)
+	failureKey := c.clientIPForLimit(r)
 	if !validTOTPCodeFormat(code) {
 		return 0, c.invalidTOTPResultForKey(failureKey)
 	}
