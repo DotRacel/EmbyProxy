@@ -21,6 +21,9 @@ var (
 	sessionStoppedRE  = regexp.MustCompile(`/sessions/playing/stopped/?$`)
 	sessionPlayingRE  = regexp.MustCompile(`/sessions/playing/?$`)
 	playbackMediaRE   = regexp.MustCompile(`(?i)/(videos|audio|items)/([^/?#]+)(?:/|$)`)
+
+	mediaBrowserAuthSchemeRE = regexp.MustCompile(`(?i)^(?:MediaBrowser|Emby)(?:\s+|$)`)
+	mediaBrowserAuthPairRE   = regexp.MustCompile(`([A-Za-z]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^,]*)`)
 )
 
 type PlaybackInput struct {
@@ -189,8 +192,16 @@ func (s *Store) LogPlayback(ctx context.Context, in PlaybackInput) error {
 	}
 	reqURL := parseRequestURL(in.RequestURL)
 	bodyValues := parsePlaybackRequestBody(in.RequestBody)
-	userID := cutString(headerOrQueryOrBody(in.Headers, reqURL, bodyValues, "X-Emby-User-Id", "X-MediaBrowser-User-Id", "UserId", "userId", "user_id"), 64)
-	deviceID := cutString(headerOrQueryOrBody(in.Headers, reqURL, bodyValues, "X-Emby-Device-Id", "X-MediaBrowser-Device-Id", "DeviceId", "deviceId", "device_id"), 64)
+	userID := headerOrQueryOrBody(in.Headers, reqURL, bodyValues, "X-Emby-User-Id", "X-MediaBrowser-User-Id", "UserId", "userId", "user_id")
+	if userID == "" {
+		userID = mediaBrowserAuthField(in.Headers, "UserId")
+	}
+	userID = cutString(userID, 64)
+	deviceID := headerOrQueryOrBody(in.Headers, reqURL, bodyValues, "X-Emby-Device-Id", "X-MediaBrowser-Device-Id", "DeviceId", "deviceId", "device_id")
+	if deviceID == "" {
+		deviceID = mediaBrowserAuthField(in.Headers, "DeviceId")
+	}
+	deviceID = cutString(deviceID, 64)
 	sessionID := cutString(headerOrQueryOrBody(in.Headers, reqURL, bodyValues, "X-Emby-Session-Id", "SessionId", "sessionId", "session_id"), 64)
 	playSessionID := cutString(headerOrQueryOrBody(in.Headers, reqURL, bodyValues, "PlaySessionId", "playSessionId", "play_session_id"), 128)
 	mediaKey := playbackStartMediaKey(reqURL, bodyValues)
@@ -322,20 +333,6 @@ func (s *Store) LogPlayback(ctx context.Context, in PlaybackInput) error {
 			return err
 		}
 		if err := upsertPlayBucket(ctx, tx, now, nodeName, client, mode, playInc, 0, 0, 0, 0, sessInc, errInc); err != nil {
-			return err
-		}
-	}
-	if playInc > 0 {
-		key := "stats:proxyPlays:" + day
-		if in.Mode == "direct" {
-			key = "stats:directPlays:" + day
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO proxy_kv (k, v, updated_at) VALUES (?, ?, ?)
-			ON CONFLICT(k) DO UPDATE SET
-				v = CAST(CAST(proxy_kv.v AS INTEGER) + CAST(excluded.v AS INTEGER) AS TEXT),
-				updated_at = MAX(proxy_kv.updated_at, excluded.updated_at)
-		`, key, strconv.FormatInt(playInc, 10), now); err != nil {
 			return err
 		}
 	}
@@ -947,6 +944,32 @@ func headerOrQuery(headers http.Header, u *url.URL, names ...string) string {
 		}
 	}
 	return QueryValue(u, names...)
+}
+
+// mediaBrowserAuthField reads one field (e.g. DeviceId) out of the
+// `MediaBrowser Client="..", DeviceId=".."` authorization header, which is the
+// only place most Emby clients send their device and user ids.
+func mediaBrowserAuthField(headers http.Header, field string) string {
+	for _, name := range []string{"X-Emby-Authorization", "X-MediaBrowser-Authorization", "Authorization"} {
+		value := strings.TrimSpace(headers.Get(name))
+		scheme := mediaBrowserAuthSchemeRE.FindString(value)
+		if scheme == "" {
+			continue
+		}
+		for _, pair := range mediaBrowserAuthPairRE.FindAllStringSubmatch(value[len(scheme):], -1) {
+			if !strings.EqualFold(pair[1], field) {
+				continue
+			}
+			v := strings.TrimSpace(pair[2])
+			if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+				v = strings.NewReplacer(`\"`, `"`, `\\`, `\`).Replace(v[1 : len(v)-1])
+			}
+			if v = strings.TrimSpace(v); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 func cutString(value string, max int) string {

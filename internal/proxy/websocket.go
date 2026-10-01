@@ -45,7 +45,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, node s
 	tried := 0
 	for pass := 0; pass < 2; pass++ {
 		for _, target := range ordered {
-			banKey := nodeKey + "|" + target
+			banKey := lineBanKey(nodeKey, target)
 			if pass == 0 {
 				if _, banned := h.lineBan.Get(banKey); banned && len(targets) > 1 {
 					continue
@@ -59,7 +59,6 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, node s
 				return
 			}
 			lastErr = errWebSocketUpgradeFailed
-			h.lineBan.Set(banKey, 1, time.Minute)
 		}
 		if tried > 0 {
 			break
@@ -89,13 +88,20 @@ func (h *Handler) tryWebSocketTarget(ctx context.Context, w http.ResponseWriter,
 		applyEmosHeaders(headers, env)
 	}
 	capture.SetMeta(r, map[string]any{"mode": "ws", "node": parsed.Name, "secret": node.Secret, "stage": "upgrade-target", "targetUrl": targetURL.String(), "outboundHeaders": headers})
+	banKey := lineBanKey("admin:"+parsed.Name, target)
 	res, upstreamConn, upstreamReader, err := h.dialWebSocket(ctx, targetURL, headers)
 	if err != nil {
+		if isLineTransportFailure(ctx, err) {
+			h.noteLineFailure(banKey)
+		}
 		h.log.Warn("ws", "upstream dial failed", map[string]any{"event": "upstreamDialFailed", "id": requestID, "node": parsed.Name, "target": logging.FormatTarget(target), "error": err.Error()})
 		return false
 	}
 	if res.StatusCode != http.StatusSwitchingProtocols {
 		_ = upstreamConn.Close()
+		if res.StatusCode >= 500 {
+			h.noteLineFailure(banKey)
+		}
 		h.log.Warn("ws", "upstream rejected upgrade", map[string]any{"event": "upstreamRejectedUpgrade", "id": requestID, "node": parsed.Name, "target": logging.FormatTarget(target), "status": res.StatusCode})
 		return false
 	}
@@ -117,6 +123,7 @@ func (h *Handler) tryWebSocketTarget(ctx context.Context, w http.ResponseWriter,
 		h.log.Warn("ws", "write upgrade response failed", map[string]any{"event": "writeUpgradeResponseFailed", "id": requestID, "node": parsed.Name, "error": err.Error()})
 		return true
 	}
+	h.noteLineSuccess(banKey)
 	h.markTargetHealthy("admin:"+parsed.Name, targets, target, expectedActive)
 	capture.SetMeta(r, map[string]any{"mode": "ws", "node": parsed.Name, "secret": node.Secret, "stage": "upgraded", "targetUrl": targetURL.String(), "outboundHeaders": headers})
 	h.log.Debug("ws", "upgrade completed", map[string]any{"event": "upgradeCompleted", "id": requestID, "node": parsed.Name, "target": logging.FormatTarget(target), "status": 101, "upgradeMs": time.Since(started).Milliseconds()})

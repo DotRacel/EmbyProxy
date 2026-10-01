@@ -30,6 +30,7 @@ type Handler struct {
 	ids                       *identity.Manager
 	log                       *logging.Logger
 	lineBan                   *ttlMap
+	lineStrikes               *ttlMap
 	progressThrottle          *ttlMap
 	playbackDedup             *ttlMap
 	imageLimiterMu            sync.Mutex
@@ -98,6 +99,7 @@ func New(cfg config.Config, store *storage.Store, ids *identity.Manager, log *lo
 		ids:                       ids,
 		log:                       log,
 		lineBan:                   newTTLMap(),
+		lineStrikes:               newTTLMap(),
 		progressThrottle:          newTTLMap(),
 		playbackDedup:             newTTLMap(),
 		imageLimiter:              imageLimiter,
@@ -144,7 +146,7 @@ func withRedirectScreen(client *http.Client) *http.Client {
 }
 
 // screenFollowRedirect rejects any redirect hop whose new target host resolves to
-// a blocked internal address, reusing the same rawHostBlocked helper the direct
+// a blocked internal address, reusing the same rawHostCheck helper the direct
 // path uses. Setting CheckRedirect removes Go's built-in 10-redirect cap, so the
 // cap is reinstated here to keep the follow clients from looping indefinitely.
 func screenFollowRedirect(req *http.Request, via []*http.Request) error {
@@ -154,10 +156,41 @@ func screenFollowRedirect(req *http.Request, via []*http.Request) error {
 	if req == nil || req.URL == nil {
 		return nil
 	}
-	if rawHostBlocked(req.Context(), req.URL.Hostname()) {
-		return fmt.Errorf("blocked redirect to internal host: %s", req.URL.Hostname())
+	// The first request already dialed this exact origin, and it may legitimately
+	// be a LAN upstream, so a hop back onto it opens no new target. Skipping the
+	// lookup also keeps a DNS hiccup from failing an ordinary same-host redirect.
+	if len(via) > 0 && via[0] != nil && sameOrigin(via[0].URL, req.URL) {
+		return nil
+	}
+	if err := rawHostCheck(req.Context(), req.URL.Hostname()); err != nil {
+		if errors.Is(err, errRawHostBlocked) {
+			return fmt.Errorf("blocked redirect to internal host: %s", req.URL.Hostname())
+		}
+		if req.Context().Err() != nil {
+			return err
+		}
+		return fmt.Errorf("redirect host lookup failed: %w", err)
 	}
 	return nil
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
 }
 
 func newRawHTTPClient() *http.Client {
@@ -343,6 +376,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) CleanupTTLMaps() {
 	h.lineBan.Cleanup()
+	h.lineStrikes.Cleanup()
 	h.progressThrottle.Cleanup()
 	h.playbackDedup.Cleanup()
 	if imageCache := h.ensureImageCache(context.Background()); imageCache != nil {
@@ -365,6 +399,7 @@ func (h *Handler) ResetNodeRoutingState(uid, name string) {
 	delete(h.activeTarget, key)
 	h.activeMu.Unlock()
 	h.lineBan.DeletePrefix(key + "|")
+	h.lineStrikes.DeletePrefix(key + "|")
 }
 
 func (h *Handler) parseRequest(r *http.Request) (parsedRoute, int, string) {
@@ -413,7 +448,7 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 	var lastAttemptMS int64
 	tried := 0
 	for _, target := range ordered {
-		banKey := nodeKey + "|" + target
+		banKey := lineBanKey(nodeKey, target)
 		if _, banned := h.lineBan.Get(banKey); banned && len(targets) > 1 {
 			continue
 		}
@@ -424,7 +459,9 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 		capture.ClearErrorMeta(r)
 		res, err := h.handleOneTarget(ctx, r, nodeTry, parsed, body, env)
 		if err != nil {
-			h.lineBan.Set(banKey, 1, time.Minute)
+			if isLineTransportFailure(ctx, err) {
+				h.noteLineFailure(banKey)
+			}
 			attemptMS := time.Since(started).Milliseconds()
 			capture.AppendErrorAttempt(r, "target-attempt", err, map[string]any{"target": logging.RedactURL(target), "targetAttemptMs": attemptMS})
 			h.log.Warn("proxy", "target failed", withAccessLogFields(ctx, map[string]any{"event": "targetFailed", "id": requestID, "node": nodeName, "target": logging.FormatTarget(target), "targetAttemptMs": attemptMS, "error": err.Error()}))
@@ -438,6 +475,7 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 			h.closeBody(lastRes)
 			lastRes = nil
 			capture.ClearErrorMeta(r)
+			h.noteLineSuccess(banKey)
 			h.markTargetHealthy(nodeKey, targets, target, expectedActive)
 			responseReadyMs := time.Since(started).Milliseconds()
 			SetAccessLogField(ctx, "responseReadyMs", responseReadyMs)
@@ -447,7 +485,11 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 			setAccessLogTargetFields(ctx, logFields)
 			return res, nil
 		}
-		h.lineBan.Set(banKey, 1, time.Minute)
+		// 403/404 still fail over, since another line may serve the path, but
+		// they describe the path rather than the line and never count against it.
+		if status >= 500 {
+			h.noteLineFailure(banKey)
+		}
 		attemptMS := time.Since(started).Milliseconds()
 		capture.AppendRetryableStatusAttempt(r, "target-attempt", status, attemptMS, logging.RedactURL(target))
 		h.log.Warn("proxy", "target returned retryable status", retryableStatusLogFields(res, withAccessLogFields(ctx, map[string]any{"event": "upstreamRetryableStatus", "id": requestID, "node": nodeName, "target": logging.FormatTarget(target), "status": status, "targetAttemptMs": attemptMS})))
@@ -475,6 +517,7 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 				h.closeBody(lastRes)
 				lastRes = nil
 				capture.ClearErrorMeta(r)
+				h.noteLineSuccess(lineBanKey(nodeKey, target))
 				h.markTargetHealthy(nodeKey, targets, target, expectedActive)
 				return res, nil
 			}
@@ -1491,25 +1534,44 @@ func SplitHostPortLoose(value string) (string, string) {
 }
 
 func rawHostBlocked(ctx context.Context, host string) bool {
+	return rawHostCheck(ctx, host) != nil
+}
+
+var errRawHostBlocked = errors.New("host resolves to a blocked address")
+
+// rawHostCheck fails closed: a host that cannot be resolved is rejected, since
+// the dial would resolve it again and could land somewhere this check never saw.
+// The error still says why, so a caller can tell a real internal-address block
+// (errRawHostBlocked) from a lookup failure or from the client going away.
+func rawHostCheck(ctx context.Context, host string) error {
 	host = strings.TrimSpace(host)
 	if host == "" {
-		return true
+		return errRawHostBlocked
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		return rawIPBlocked(ip)
+		if rawIPBlocked(ip) {
+			return errRawHostBlocked
+		}
+		return nil
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, rawHostLookupTimeout)
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", host)
 	if err != nil || len(ips) == 0 {
-		return true
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if err == nil {
+			err = fmt.Errorf("lookup %s: no addresses", host)
+		}
+		return err
 	}
 	for _, ip := range ips {
 		if rawIPBlocked(ip) {
-			return true
+			return errRawHostBlocked
 		}
 	}
-	return false
+	return nil
 }
 
 func rawIPBlocked(ip net.IP) bool {

@@ -1578,6 +1578,7 @@ func TestHandleNodeHidesTargetErrorDetails(t *testing.T) {
 	h := &Handler{
 		log:          logging.New("silent", false),
 		lineBan:      newTTLMap(),
+		lineStrikes:  newTTLMap(),
 		activeTarget: map[string]string{},
 	}
 	req := httptest.NewRequest(http.MethodGet, "/node/emby/System/Info", nil)

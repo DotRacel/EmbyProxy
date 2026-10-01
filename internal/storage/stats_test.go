@@ -69,14 +69,16 @@ func TestLogPlaybackConcurrentSessionDedup(t *testing.T) {
 		t.Fatalf("play_stats = plays %d, sessions %d; want 1, 1", plays, sessions)
 	}
 
-	var counter string
+	// play_buckets is the only source GetRangeStats reads, so no per-day
+	// counter should pile up in proxy_kv alongside it.
+	var counters int
 	if err := store.db.QueryRowContext(ctx, `
-		SELECT v FROM proxy_kv WHERE k LIKE 'stats:proxyPlays:%'
-	`).Scan(&counter); err != nil {
-		t.Fatalf("query proxy play counter error = %v", err)
+		SELECT COUNT(*) FROM proxy_kv WHERE k LIKE 'stats:%'
+	`).Scan(&counters); err != nil {
+		t.Fatalf("query proxy_kv stats keys error = %v", err)
 	}
-	if counter != "1" {
-		t.Fatalf("proxy play counter = %q; want 1", counter)
+	if counters != 0 {
+		t.Fatalf("proxy_kv stats keys = %d; want 0", counters)
 	}
 }
 
@@ -1131,17 +1133,6 @@ func TestLogPlaybackAsyncUsesOccurredAtForStatsTime(t *testing.T) {
 	if lastPlayAt != occurredAt {
 		t.Fatalf("last_play_ts = %d; want %d", lastPlayAt, occurredAt)
 	}
-
-	var counter string
-	var counterUpdatedAt int64
-	if err := store.db.QueryRowContext(ctx, `
-		SELECT v, updated_at FROM proxy_kv WHERE k = ?
-	`, "stats:proxyPlays:2000-01-03").Scan(&counter, &counterUpdatedAt); err != nil {
-		t.Fatalf("query proxy play counter error = %v", err)
-	}
-	if counter != "1" || counterUpdatedAt != occurredAt {
-		t.Fatalf("proxy play counter = %q updatedAt=%d; want 1 updatedAt=%d", counter, counterUpdatedAt, occurredAt)
-	}
 }
 
 func TestGetPlayStatsUsesUTC8CalendarWindow(t *testing.T) {
@@ -1477,5 +1468,89 @@ func TestPrunePlaybackStatesRemovesOnlyExpiredRows(t *testing.T) {
 	}
 	if keys != "active" {
 		t.Fatalf("remaining playback state keys = %q, want active", keys)
+	}
+}
+
+// Most Emby clients carry their device id only inside X-Emby-Authorization.
+// Behind a reverse proxy every viewer also shares one request IP, so without
+// reading that header two people on the same client build collapsed into one
+// session.
+func TestLogPlaybackSeparatesDevicesFromAuthorizationHeader(t *testing.T) {
+	ctx := context.Background()
+	store := newStatsTestStore(t)
+
+	base := time.Date(2026, 6, 8, 9, 0, 0, 0, localtime.Location()).UnixMilli()
+	for i, auth := range []string{
+		`MediaBrowser Client="VidHub", Device="iPhone", DeviceId="device-a", Version="3.0.0", Token="t1"`,
+		`Emby UserId=user-b, Client=VidHub, Device=iPad, DeviceId=device-b, Version=3.0.0`,
+	} {
+		input := PlaybackInput{
+			Node:        Node{Name: "alpha"},
+			RequestIP:   "172.18.0.1",
+			Headers:     http.Header{"User-Agent": {"VidHub/3.0.0"}, "X-Emby-Authorization": {auth}},
+			Status:      http.StatusNoContent,
+			IsPlayback:  true,
+			Mode:        "proxy",
+			RequestURL:  "/emby/Sessions/Playing",
+			Method:      http.MethodPost,
+			RequestBody: []byte(fmt.Sprintf(`{"ItemId": "item-%d", "PlaySessionId": "play-%d"}`, i, i)),
+			OccurredAt:  base + int64(i)*int64(time.Minute/time.Millisecond),
+		}
+		if err := store.LogPlayback(ctx, input); err != nil {
+			t.Fatalf("LogPlayback(%d) error = %v", i, err)
+		}
+	}
+
+	var plays, sessions int64
+	if err := store.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(plays), 0), COALESCE(SUM(sessions), 0)
+		FROM play_stats WHERE node = ? AND client = ?
+	`, "alpha", "VidHub/3.0.0").Scan(&plays, &sessions); err != nil {
+		t.Fatalf("query play_stats error = %v", err)
+	}
+	if plays != 2 || sessions != 2 {
+		t.Fatalf("play_stats = plays %d, sessions %d; want 2, 2", plays, sessions)
+	}
+
+	var keys []string
+	rows, err := store.db.QueryContext(ctx, `SELECT k FROM play_sessions ORDER BY k`)
+	if err != nil {
+		t.Fatalf("query play_sessions error = %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, k)
+	}
+	want := []string{"alpha|VidHub/3.0.0|172.18.0.1|user-b|device-b", "alpha|VidHub/3.0.0|172.18.0.1||device-a"}
+	if fmt.Sprint(keys) != fmt.Sprint(want) {
+		t.Fatalf("play_sessions keys = %q, want %q", keys, want)
+	}
+}
+
+func TestMediaBrowserAuthField(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers http.Header
+		field   string
+		want    string
+	}{
+		{"quoted", http.Header{"X-Emby-Authorization": {`MediaBrowser Client="A", DeviceId="dev 1", Version="1"`}}, "DeviceId", "dev 1"},
+		{"unquoted", http.Header{"X-Emby-Authorization": {`Emby DeviceId=dev2,UserId=u2`}}, "UserId", "u2"},
+		{"case insensitive key", http.Header{"X-Emby-Authorization": {`MediaBrowser deviceid="dev3"`}}, "DeviceId", "dev3"},
+		{"authorization header", http.Header{"Authorization": {`MediaBrowser DeviceId="dev4"`}}, "DeviceId", "dev4"},
+		{"bearer is not mediabrowser", http.Header{"Authorization": {`Bearer DeviceId=nope`}}, "DeviceId", ""},
+		{"no partial key match", http.Header{"X-Emby-Authorization": {`MediaBrowser OtherDeviceId="x"`}}, "DeviceId", ""},
+		{"missing", http.Header{}, "DeviceId", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mediaBrowserAuthField(tc.headers, tc.field); got != tc.want {
+				t.Fatalf("mediaBrowserAuthField() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

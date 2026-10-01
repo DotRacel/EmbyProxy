@@ -61,6 +61,29 @@ func (m *ttlMap) Get(key string) (any, bool) {
 	return current.value, true
 }
 
+// Incr bumps the counter at key and returns its new value. The window opens on
+// the first increment and later ones do not extend it, so the count only ever
+// covers events that happened within ttl of the first.
+func (m *ttlMap) Incr(key string, ttl time.Duration) int {
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry, ok := m.m[key]; ok && !now.After(entry.exp) {
+		n, _ := entry.value.(int)
+		entry.value = n + 1
+		m.m[key] = entry
+		return n + 1
+	}
+	if _, exists := m.m[key]; !exists && len(m.m) >= maxTTLMapSize {
+		m.cleanupLocked(now)
+		if len(m.m) >= maxTTLMapSize {
+			return 0
+		}
+	}
+	m.m[key] = ttlEntry{value: 1, exp: now.Add(ttl)}
+	return 1
+}
+
 func (m *ttlMap) Delete(key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
