@@ -5,19 +5,23 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"embyproxy/internal/auth"
@@ -36,10 +40,60 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-//go:embed static/index.html
-var indexHTML string
+// staticFS 是随二进制发布的管理面板：static/index.html 加 static/assets/ 下的样式、脚本、字体等。
+//
+//go:embed static
+var staticFS embed.FS
+
+// indexHTML 是管理页本体，GET /admin 直接返回它。
+var indexHTML = mustReadStatic("static/index.html")
+
+// adminSource 是 index.html 与 static/assets 下全部 .js/.css（按路径排序）拼起来的前端源码，
+// 供测试检查界面里的关键片段，前端拆成多个文件后也不用逐个去读。
+var adminSource = buildAdminSource()
+
+const assetsPrefix = "/admin/assets/"
+
+func mustReadStatic(name string) string {
+	b, err := staticFS.ReadFile(name)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+func buildAdminSource() string {
+	names := []string{}
+	_ = fs.WalkDir(staticFS, "static/assets", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// assets 目录还不存在时什么都不拼。
+			return nil
+		}
+		if ext := path.Ext(name); !d.IsDir() && (ext == ".js" || ext == ".css") {
+			names = append(names, name)
+		}
+		return nil
+	})
+	sort.Strings(names)
+	parts := []string{indexHTML}
+	for _, name := range names {
+		parts = append(parts, mustReadStatic(name))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func defaultAssets() fs.FS {
+	sub, err := fs.Sub(staticFS, "static/assets")
+	if err != nil {
+		panic(err)
+	}
+	return sub
+}
 
 type ResetFunc func(uid, name string)
+
+// ActiveTargetFunc 查询代理当前实际转发到的上游线路，未知时返回空串。
+type ActiveTargetFunc func(uid, name string, targets []string) string
 
 type ImageCacheManager interface {
 	ImageCacheStats(ctx context.Context) (proxy.ImageCacheStats, error)
@@ -79,6 +133,9 @@ type Handler struct {
 	imageCache ImageCacheManager
 	probes     *probe.Registry
 	prober     *probe.Prober
+	active     ActiveTargetFunc
+	assets     fs.FS
+	assetCache sync.Map
 }
 
 func New(cfg config.Config, store *storage.Store, checker *auth.Checker, tg *telegram.Service, log *logging.Logger, reset ResetFunc, imageCaches ...ImageCacheManager) *Handler {
@@ -94,6 +151,7 @@ func New(cfg config.Config, store *storage.Store, checker *auth.Checker, tg *tel
 		log:        log,
 		resetRoute: reset,
 		imageCache: imageCache,
+		assets:     defaultAssets(),
 	}
 }
 
@@ -103,7 +161,17 @@ func (h *Handler) AttachProbes(registry *probe.Registry, prober *probe.Prober) {
 	h.prober = prober
 }
 
+// AttachActiveTargets 绑定代理的当前线路查询，probe.summary 据此给出 activeTarget。
+func (h *Handler) AttachActiveTargets(fn ActiveTargetFunc) {
+	h.active = fn
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 面板的样式、脚本和字体是公开的静态文件，不需要登录，也要在 Token 配置错误时照常可取。
+	if strings.HasPrefix(r.URL.Path, assetsPrefix) {
+		h.serveAsset(w, r)
+		return
+	}
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	if r.Method == http.MethodGet && (path == "/admin" || path == "") {
 		capture.SetMeta(r, map[string]any{"mode": "admin", "stage": "admin-page"})
@@ -158,6 +226,89 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 	w.Header().Set("ETag", indexETag)
 	http.ServeContent(w, r, "index.html", time.Time{}, strings.NewReader(indexHTML))
+}
+
+type assetEntry struct {
+	content []byte
+	etag    string
+}
+
+// assetContentTypes 显式列出面板会用到的类型：mime.TypeByExtension 依赖系统的 mime 表，
+// 精简镜像里往往认不出 .woff2。
+var assetContentTypes = map[string]string{
+	".css":   "text/css; charset=utf-8",
+	".js":    "text/javascript; charset=utf-8",
+	".mjs":   "text/javascript; charset=utf-8",
+	".json":  "application/json; charset=utf-8",
+	".map":   "application/json; charset=utf-8",
+	".svg":   "image/svg+xml",
+	".png":   "image/png",
+	".jpg":   "image/jpeg",
+	".jpeg":  "image/jpeg",
+	".webp":  "image/webp",
+	".ico":   "image/x-icon",
+	".woff":  "font/woff",
+	".woff2": "font/woff2",
+	".ttf":   "font/ttf",
+}
+
+func assetContentType(name string) string {
+	ext := strings.ToLower(path.Ext(name))
+	if ct, ok := assetContentTypes[ext]; ok {
+		return ct
+	}
+	if ct := mime.TypeByExtension(ext); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
+}
+
+// serveAsset 返回 static/assets 下的文件。缓存策略与管理页一致：no-cache + 内容哈希 ETag，
+// 升级后立刻生效，未变化时只回 304。目录、不存在的文件和越界路径一律 404。
+func (h *Handler) serveAsset(w http.ResponseWriter, r *http.Request) {
+	// 静态文件对排查代理问题没有价值，一次打开面板就是十几条，不写进代理流量记录。
+	capture.Suppress(r)
+	capture.SetMeta(r, map[string]any{"mode": "admin", "stage": "admin-asset"})
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimPrefix(r.URL.Path, assetsPrefix)
+	entry, ok := h.asset(name)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", assetContentType(name))
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("ETag", entry.etag)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(entry.content))
+}
+
+// asset 读取并缓存单个静态文件。嵌入的内容不会变，命中后不再重复读取和计算哈希；
+// 不存在的路径不缓存，免得被随意探测的请求撑大。
+func (h *Handler) asset(name string) (assetEntry, bool) {
+	// fs.ValidPath 拒绝空串、绝对路径、空段以及 . / .. 段，杜绝越界读取。
+	if h.assets == nil || name == "" || name == "." || !fs.ValidPath(name) {
+		return assetEntry{}, false
+	}
+	if hit, ok := h.assetCache.Load(name); ok {
+		return hit.(assetEntry), true
+	}
+	info, err := fs.Stat(h.assets, name)
+	if err != nil || info.IsDir() {
+		return assetEntry{}, false
+	}
+	content, err := fs.ReadFile(h.assets, name)
+	if err != nil {
+		return assetEntry{}, false
+	}
+	sum := sha256.Sum256(content)
+	entry := assetEntry{content: content, etag: fmt.Sprintf(`"%x"`, sum[:16])}
+	h.assetCache.Store(name, entry)
+	return entry, true
 }
 
 func (h *Handler) handleAuth(w http.ResponseWriter, r *http.Request, path string) {
@@ -542,7 +693,7 @@ func (h *Handler) dispatch(ctx context.Context, uid, action string, body map[str
 	case "probe.summary":
 		return h.probeSummary(ctx, uid), http.StatusOK
 	case "probe.series":
-		return h.probeSeries(body), http.StatusOK
+		return h.probeSeries(ctx, uid, body), http.StatusOK
 	case "compactAll":
 		nodes, err := h.store.ListNodes(ctx, uid)
 		if err != nil {
@@ -564,18 +715,7 @@ func (h *Handler) dispatch(ctx context.Context, uid, action string, body map[str
 	case "tg.set":
 		return h.tgSet(ctx, body), http.StatusOK
 	case "tg.test":
-		cfg, err := h.store.GetTGConfig(ctx)
-		if err != nil {
-			return fail(err.Error()), http.StatusInternalServerError
-		}
-		if cfg.Token == "" || cfg.Chat == "" {
-			return fail("TG 未配置"), http.StatusOK
-		}
-		text, err := h.telegram.BuildReport(ctx, time.Now().UnixMilli())
-		if err != nil {
-			return fail(err.Error()), http.StatusInternalServerError
-		}
-		return map[string]any{"ok": h.telegram.Send(ctx, cfg, text)}, http.StatusOK
+		return h.tgTest(ctx, body)
 	case "config.get":
 		cfg, err := h.store.GetSystemConfig(ctx, h.defaultSystemConfig())
 		if err != nil {
@@ -584,8 +724,6 @@ func (h *Handler) dispatch(ctx context.Context, uid, action string, body map[str
 		return map[string]any{"ok": true, "config": cfg, "content": cfg}, http.StatusOK
 	case "config.set":
 		return h.configSet(ctx, body), http.StatusOK
-	case "keepalive.test":
-		return h.keepaliveTest(ctx, body)
 	case "stats.get":
 		days := clamp(intValue(body["days"], 7), 1, 30)
 		stats, err := h.store.GetPlayStats(ctx, days)
@@ -994,16 +1132,6 @@ func (h *Handler) list(ctx context.Context, uid string) map[string]any {
 	if err != nil {
 		return fail(err.Error())
 	}
-	states, err := h.store.GetAllKeepaliveStates(ctx)
-	if err == nil {
-		lastMap := map[string]int64{}
-		for _, st := range states {
-			lastMap[strings.ToLower(st.Node)] = st.LastPlayTS
-		}
-		for i := range nodes {
-			nodes[i].LastPlayAt = lastMap[uid+":"+strings.ToLower(nodes[i].Name)]
-		}
-	}
 	return map[string]any{"ok": true, "nodes": nodes, "uid": uid, "build": buildinfo.Current()}
 }
 
@@ -1181,7 +1309,12 @@ func (h *Handler) probeStats(ctx context.Context, uid string) []probe.NodeStats 
 		return out
 	}
 	for _, node := range nodes {
-		out = append(out, h.probes.Stats(node.Name, storage.SplitTargets(node.Target)))
+		targets := storage.SplitTargets(node.Target)
+		stats := h.probes.Stats(node.Name, targets)
+		if h.active != nil {
+			stats.ActiveTarget = h.active(uid, node.Name, targets)
+		}
+		out = append(out, stats)
 	}
 	return out
 }
@@ -1196,7 +1329,7 @@ func (h *Handler) probeSummary(ctx context.Context, uid string) map[string]any {
 	}
 }
 
-func (h *Handler) probeSeries(body map[string]any) map[string]any {
+func (h *Handler) probeSeries(ctx context.Context, uid string, body map[string]any) map[string]any {
 	name := validators.NormalizeName(body["name"])
 	if name == "" {
 		return fail("缺少节点名称")
@@ -1205,11 +1338,24 @@ func (h *Handler) probeSeries(body map[string]any) map[string]any {
 	// 桶宽要能对齐采样周期：探测每分钟一次，桶宽比它粗的话连续多个采样会塌进同一个桶，
 	// 曲线要等好几个周期才出得来。上限按 24 小时窗口 × 每分钟一个桶留足。
 	buckets := clamp(intValue(body["buckets"], hours*60), 12, 1440)
+	// perTarget 时额外给出每条上游线路的曲线，按节点配置顺序排列，与整体曲线共用时间桶。
+	perTarget := validators.ToBool(body["perTarget"])
 	points := []probe.Point{}
+	lines := []probe.TargetSeries{}
 	if h.probes != nil {
-		points = h.probes.Series(name, time.Duration(hours)*time.Hour, buckets)
+		var targets []string
+		if perTarget && h.store != nil {
+			if node, err := h.store.GetNode(ctx, uid, name); err == nil && node != nil {
+				targets = storage.SplitTargets(node.Target)
+			}
+		}
+		points, lines = h.probes.SeriesWithTargets(name, targets, time.Duration(hours)*time.Hour, buckets)
 	}
-	return map[string]any{"ok": true, "name": name, "hours": hours, "points": points}
+	res := map[string]any{"ok": true, "name": name, "hours": hours, "points": points}
+	if perTarget {
+		res["targets"] = lines
+	}
+	return res
 }
 
 func (h *Handler) tgSet(ctx context.Context, body map[string]any) map[string]any {
@@ -1220,12 +1366,62 @@ func (h *Handler) tgSet(ctx context.Context, body map[string]any) map[string]any
 	if cfgMap == nil {
 		cfgMap = map[string]any{}
 	}
+	current, err := h.store.GetTGConfig(ctx)
+	if err != nil {
+		return fail(err.Error())
+	}
+	cfg, errText := parseTGConfig(cfgMap, current)
+	if errText != "" {
+		return fail(errText)
+	}
+	if err := h.store.SaveTGConfig(ctx, cfg); err != nil {
+		return fail(err.Error())
+	}
+	return ok()
+}
+
+// tgTest 试发一条通知。默认只发一句渠道测试；kind 为 report 时发一份当前的播放日报。
+// 带 tg 对象时用它覆盖已保存的配置，面板可以在保存前先验证表单里的 Token / Chat ID。
+func (h *Handler) tgTest(ctx context.Context, body map[string]any) (map[string]any, int) {
+	if h.telegram == nil {
+		return fail("通知服务未初始化"), http.StatusOK
+	}
+	cfg, err := h.store.GetTGConfig(ctx)
+	if err != nil {
+		return fail(err.Error()), http.StatusInternalServerError
+	}
+	if override := mapFromAny(body["tg"]); override != nil {
+		parsed, errText := parseTGConfig(override, cfg)
+		if errText != "" {
+			return fail(errText), http.StatusOK
+		}
+		cfg = parsed
+	}
+	if !cfg.Configured() {
+		return fail("TG 未配置"), http.StatusOK
+	}
+	text := telegram.TestMessage
+	if strings.TrimSpace(asString(body["kind"])) == "report" {
+		text, err = h.telegram.BuildReportFor(ctx, cfg.ReportTime, time.Now().UnixMilli())
+		if err != nil {
+			return fail(err.Error()), http.StatusInternalServerError
+		}
+	}
+	if !h.telegram.Send(ctx, cfg, text) {
+		return fail("发送失败，请检查 Token、Chat ID 与服务器网络"), http.StatusOK
+	}
+	return ok(), http.StatusOK
+}
+
+// parseTGConfig 校验并规范化面板提交的通知配置。原有字段缺省时按旧行为处理（关闭/空），
+// 告警相关字段缺省时沿用 current，老版本面板保存时不会把告警悄悄关掉。
+func parseTGConfig(cfgMap map[string]any, current storage.TGConfig) (storage.TGConfig, string) {
 	reportTime := strings.TrimSpace(asString(cfgMap["reportTime"]))
 	reportTime = strings.NewReplacer("﹕", ":", "∶", ":").Replace(reportTime)
 	if reportTime != "" {
 		m := regexp.MustCompile(`^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.\d+)?)?$`).FindStringSubmatch(reportTime)
 		if len(m) == 0 {
-			return fail("日报推送时间格式不合法（HH:mm）")
+			return storage.TGConfig{}, "日报推送时间格式不合法（HH:mm）"
 		}
 		hh := clamp(intString(m[1]), 0, 23)
 		mm := clamp(intString(m[2]), 0, 59)
@@ -1236,23 +1432,31 @@ func (h *Handler) tgSet(ctx context.Context, body map[string]any) map[string]any
 	}
 	serverRemark := strings.TrimSpace(asString(cfgMap["serverRemark"]))
 	if strings.ContainsAny(serverRemark, "\r\n") {
-		return fail("服务器备注不能包含换行")
+		return storage.TGConfig{}, "服务器备注不能包含换行"
 	}
 	if len([]rune(serverRemark)) > telegramServerRemarkMaxRunes {
-		return fail(fmt.Sprintf("服务器备注不能超过 %d 个字符", telegramServerRemarkMaxRunes))
+		return storage.TGConfig{}, fmt.Sprintf("服务器备注不能超过 %d 个字符", telegramServerRemarkMaxRunes)
 	}
-	cfg := storage.TGConfig{
-		Enabled:       validators.ToBool(cfgMap["enabled"]),
-		Token:         strings.TrimSpace(asString(cfgMap["token"])),
-		Chat:          strings.TrimSpace(asString(cfgMap["chat"])),
-		ServerRemark:  serverRemark,
-		ReportEnabled: boolValue(cfgMap, "reportEnabled", validators.ToBool(cfgMap["enabled"])),
-		ReportTime:    reportTime,
+	threshold := current.AlertFailThreshold
+	if _, ok := cfgMap["alertFailThreshold"]; ok {
+		var errText string
+		threshold, errText = normalizeRangedInt(cfgMap["alertFailThreshold"], "节点故障判定的连续失败次数",
+			storage.MinAlertFailThreshold, storage.MaxAlertFailThreshold)
+		if errText != "" {
+			return storage.TGConfig{}, errText
+		}
 	}
-	if err := h.store.SaveTGConfig(ctx, cfg); err != nil {
-		return fail(err.Error())
-	}
-	return ok()
+	return storage.TGConfig{
+		Enabled:            validators.ToBool(cfgMap["enabled"]),
+		Token:              strings.TrimSpace(asString(cfgMap["token"])),
+		Chat:               strings.TrimSpace(asString(cfgMap["chat"])),
+		ServerRemark:       serverRemark,
+		ReportEnabled:      boolValue(cfgMap, "reportEnabled", validators.ToBool(cfgMap["enabled"])),
+		ReportTime:         reportTime,
+		AlertNodes:         boolValue(cfgMap, "alertNodes", current.AlertNodes),
+		AlertErrors:        boolValue(cfgMap, "alertErrors", current.AlertErrors),
+		AlertFailThreshold: threshold,
+	}, ""
 }
 
 func (h *Handler) configSet(ctx context.Context, body map[string]any) map[string]any {
@@ -1392,44 +1596,13 @@ func (h *Handler) configSet(ctx context.Context, body map[string]any) map[string
 	}
 	h.log.Configure(cfg.LogLevel, cfg.LogAccess)
 	if err := h.log.ReconfigureHistory(cfg.LogHistoryEntriesPerFile, cfg.LogHistoryMaxFiles); err != nil {
-		h.log.Warn("config", "console log history reconfigure failed", map[string]any{"event": "consoleLogHistoryReconfigureFailed", "error": err.Error()})
+		h.log.Error("config", "console log history reconfigure failed", map[string]any{"event": "consoleLogHistoryReconfigureFailed", "error": err.Error()})
 	}
 	return ok()
 }
 
 func (h *Handler) defaultSystemConfig() storage.SystemConfig {
 	return storage.DefaultSystemConfig()
-}
-
-func (h *Handler) keepaliveTest(ctx context.Context, body map[string]any) (map[string]any, int) {
-	cfg, err := h.store.GetTGConfig(ctx)
-	if err != nil {
-		return fail(err.Error()), http.StatusInternalServerError
-	}
-	if !cfg.Enabled || cfg.Token == "" || cfg.Chat == "" {
-		return fail("请先在TG设置中启用并配置 Token/Chat ID"), http.StatusBadRequest
-	}
-	name := asString(body["displayName"])
-	if strings.TrimSpace(name) == "" {
-		name = asString(body["name"])
-	}
-	if strings.TrimSpace(name) == "" {
-		name = "未命名节点"
-	}
-	renewDays := maxInt(0, intValue(body["renewDays"], 0))
-	remindBeforeDays := maxInt(0, intValue(body["remindBeforeDays"], 0))
-	keepaliveAt := strings.TrimSpace(asString(body["keepaliveAt"]))
-	if !regexp.MustCompile(`^([01]\d|2[0-3]):([0-5]\d)$`).MatchString(keepaliveAt) {
-		keepaliveAt = "00:00"
-	}
-	text := strings.Join([]string{
-		"保号测试通知",
-		"节点:" + name,
-		fmt.Sprintf("保号周期:%d天", renewDays),
-		fmt.Sprintf("提前提醒:%d天", remindBeforeDays),
-		"提醒时间:北京时间 " + keepaliveAt,
-	}, "\n")
-	return map[string]any{"ok": h.telegram.Send(ctx, cfg, text)}, http.StatusOK
 }
 
 func (h *Handler) reset(uid, name string) {
@@ -1440,20 +1613,15 @@ func (h *Handler) reset(uid, name string) {
 
 func exportNode(node storage.Node) map[string]any {
 	out := map[string]any{
-		"name":                node.Name,
-		"target":              node.Target,
-		"fav":                 node.Fav,
-		"secret":              node.Secret,
-		"tag":                 node.Tag,
-		"displayName":         node.DisplayName,
-		"directExternal":      node.DirectExternal,
-		"renewDays":           node.RenewDays,
-		"remindBeforeDays":    node.RemindBeforeDays,
-		"keepaliveAt":         node.KeepaliveAt,
-		"keepaliveMaxPerDay":  node.KeepaliveMaxPerDay,
-		"keepaliveChangeOnly": node.KeepaliveChangeOnly,
-		"impersonate":         node.Impersonate,
-		"impersonateProfile":  node.ImpersonateProfile,
+		"name":               node.Name,
+		"target":             node.Target,
+		"fav":                node.Fav,
+		"secret":             node.Secret,
+		"tag":                node.Tag,
+		"displayName":        node.DisplayName,
+		"directExternal":     node.DirectExternal,
+		"impersonate":        node.Impersonate,
+		"impersonateProfile": node.ImpersonateProfile,
 	}
 	return out
 }
@@ -1827,13 +1995,6 @@ func clamp(value, minValue, maxValue int) int {
 		return maxValue
 	}
 	return value
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func asString(value any) string {

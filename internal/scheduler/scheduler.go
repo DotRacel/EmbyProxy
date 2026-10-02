@@ -49,7 +49,4 @@ func (s *Scheduler) tick(ctx context.Context) {
 	if err := s.tg.CheckAndSendReport(ctx); err != nil {
 		s.log.Error("scheduler", "report error", map[string]any{"event": "reportError", "error": err.Error()})
 	}
-	if err := s.tg.CheckKeepaliveAndNotify(ctx); err != nil {
-		s.log.Error("scheduler", "keepalive error", map[string]any{"event": "keepaliveError", "error": err.Error()})
-	}
 }

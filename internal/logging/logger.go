@@ -3,6 +3,7 @@ package logging
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -28,6 +29,9 @@ const (
 	// 清理时多扫一段轮转文件，避免上一次运行用了更大的保留文件数时留下孤儿文件。
 	// 与 storage.MaxLogHistoryMaxFiles 保持一致。
 	logHistorySweepFiles = 200
+	// historyFailureInterval 落盘失败的 ERROR 日志最短间隔。磁盘满或目录不可写时每写一行
+	// 日志都会失败，不节流的话控制台会被自己的报错刷屏。
+	historyFailureInterval = time.Minute
 )
 
 var (
@@ -111,6 +115,27 @@ type Logger struct {
 	history *logHistory
 	subMu   sync.Mutex
 	subs    map[chan LogEntry]struct{}
+	obsMu   sync.RWMutex
+	obsSeq  uint64
+	errObs  map[uint64]func(ErrorRecord)
+	thrMu   sync.Mutex
+	thr     map[string]*throttleState
+}
+
+// throttleState 记录一个 scope+event 上次真正写出日志的时间，以及之后被压下的条数。
+type throttleState struct {
+	last       time.Time
+	suppressed int
+}
+
+// ErrorRecord 一条 ERROR 日志的结构化摘要，交给 ObserveErrors 注册的观察者。
+// Message 与 Error 都已脱敏，可以直接对外发送。
+type ErrorRecord struct {
+	Time    time.Time
+	Scope   string
+	Message string
+	Event   string
+	Error   string
 }
 
 type LogEntry struct {
@@ -161,7 +186,15 @@ type logHistory struct {
 	writer          *bufio.Writer
 	closed          bool
 	done            chan struct{}
+	// onFlushError 后台定时刷盘失败时回调（不持有 mu），由 Logger 转成节流后的 ERROR。
+	onFlushError func(error)
 }
+
+// historyRotateError 标记 Append 里轮转文件这一步失败，便于和普通写入失败区分开。
+type historyRotateError struct{ err error }
+
+func (e historyRotateError) Error() string { return "rotate: " + e.err.Error() }
+func (e historyRotateError) Unwrap() error { return e.err }
 
 func (f LogFilter) empty() bool {
 	return len(f.Levels) == 0 && strings.TrimSpace(f.Query) == "" && strings.TrimSpace(f.Node) == ""
@@ -255,6 +288,53 @@ func (l *Logger) Subscribe(buf int) (<-chan LogEntry, func()) {
 	return ch, cancel
 }
 
+// ObserveErrors 注册一个 ERROR 日志观察者，返回取消函数。观察者在写日志的 goroutine 里
+// 同步调用（此时不持有日志锁），必须立刻返回，通常只是把记录投进带缓冲的 channel。
+// 与日志等级无关：即使控制台等级是 silent，ERROR 也会交给观察者。
+func (l *Logger) ObserveErrors(fn func(ErrorRecord)) func() {
+	if l == nil || fn == nil {
+		return func() {}
+	}
+	l.obsMu.Lock()
+	if l.errObs == nil {
+		l.errObs = map[uint64]func(ErrorRecord){}
+	}
+	l.obsSeq++
+	id := l.obsSeq
+	l.errObs[id] = fn
+	l.obsMu.Unlock()
+	return func() {
+		l.obsMu.Lock()
+		delete(l.errObs, id)
+		l.obsMu.Unlock()
+	}
+}
+
+func (l *Logger) notifyErrorObservers(scope, msg string, meta map[string]any) {
+	l.obsMu.RLock()
+	observers := make([]func(ErrorRecord), 0, len(l.errObs))
+	for _, fn := range l.errObs {
+		observers = append(observers, fn)
+	}
+	l.obsMu.RUnlock()
+	if len(observers) == 0 {
+		return
+	}
+	rec := ErrorRecord{
+		Time:    time.Now(),
+		Scope:   scope,
+		Message: RedactText(msg),
+		Event:   promotedMetaValue(meta, "event"),
+	}
+	if value, ok := meta["error"]; ok && value != nil {
+		rec.Error = RedactText(fmt.Sprint(value))
+	}
+	// 锁外回调：观察者里再写 ERROR 或取消订阅都不会卡死。
+	for _, fn := range observers {
+		fn(rec)
+	}
+}
+
 func (l *Logger) broadcast(entry LogEntry) {
 	if l == nil {
 		return
@@ -344,6 +424,9 @@ func (l *Logger) EnableHistory(path string, entriesPerFile, maxFiles int) error 
 	history, err := newLogHistory(path, entriesPerFile, maxFiles)
 	if err != nil {
 		return err
+	}
+	history.onFlushError = func(err error) {
+		l.reportHistoryFailure("consoleLogHistoryFlushFailed", "console log history flush failed", err)
 	}
 	l.history = history
 	return nil
@@ -468,7 +551,74 @@ func (l *Logger) Info(scope, msg string, meta map[string]any)  { l.write("info",
 func (l *Logger) Warn(scope, msg string, meta map[string]any)  { l.write("warn", scope, msg, meta) }
 func (l *Logger) Error(scope, msg string, meta map[string]any) { l.write("error", scope, msg, meta) }
 
+// ErrorThrottled 与 Error 相同，但同一 scope+event 在 interval 内只真正写一条日志，
+// 期间压下的条数记在下一条的 suppressed 字段里。用于持久性故障下每个请求都会失败的位置
+// （数据库写入、文件写入等），免得刷屏。每次调用仍会交给 ERROR 观察者，告警里的条数不受影响。
+func (l *Logger) ErrorThrottled(interval time.Duration, scope, msg string, meta map[string]any) {
+	if l == nil {
+		return
+	}
+	key := scope + "|" + promotedMetaValue(meta, "event")
+	if key == scope+"|" {
+		key += msg
+	}
+	allowed, suppressed := l.throttleAllow(key, interval)
+	if !allowed {
+		l.notifyErrorObservers(scope, msg, meta)
+		return
+	}
+	if suppressed > 0 {
+		merged := make(map[string]any, len(meta)+1)
+		for k, v := range meta {
+			merged[k] = v
+		}
+		merged["suppressed"] = suppressed
+		meta = merged
+	}
+	l.write("error", scope, msg, meta)
+}
+
+func (l *Logger) throttleAllow(key string, interval time.Duration) (bool, int) {
+	now := time.Now()
+	l.thrMu.Lock()
+	defer l.thrMu.Unlock()
+	if l.thr == nil {
+		l.thr = map[string]*throttleState{}
+	}
+	st := l.thr[key]
+	if st == nil {
+		st = &throttleState{}
+		l.thr[key] = st
+	}
+	if !st.last.IsZero() && now.Sub(st.last) < interval {
+		st.suppressed++
+		return false, 0
+	}
+	suppressed := st.suppressed
+	st.last, st.suppressed = now, 0
+	return true, suppressed
+}
+
+// reportHistoryFailure 把落盘失败报成节流后的 ERROR。这条报错本身不再写落盘历史，
+// 否则它的写入失败又会触发一次上报。
+func (l *Logger) reportHistoryFailure(event, msg string, err error) {
+	meta := map[string]any{"event": event, "error": err.Error()}
+	allowed, suppressed := l.throttleAllow("logging|"+event, historyFailureInterval)
+	if !allowed {
+		l.notifyErrorObservers("logging", msg, meta)
+		return
+	}
+	if suppressed > 0 {
+		meta["suppressed"] = suppressed
+	}
+	l.writeEntry("error", "logging", msg, meta, false)
+}
+
 func (l *Logger) write(level, scope, msg string, meta map[string]any) {
+	l.writeEntry(level, scope, msg, meta, true)
+}
+
+func (l *Logger) writeEntry(level, scope, msg string, meta map[string]any, persist bool) {
 	level = normalizeLevel(level)
 	status := promotedMetaValue(meta, "status")
 	parts := []string{localtime.RFC3339(time.Now()), "[" + strings.ToUpper(level) + "]"}
@@ -484,15 +634,27 @@ func (l *Logger) write(level, scope, msg string, meta map[string]any) {
 	}
 	line := strings.Join(parts, " ")
 	entry := LogEntry{Time: parts[0], Level: level, Scope: scope, Message: RedactText(msg), Line: line}
+	var historyErr error
 	l.mu.Lock()
 	if l.buffer != nil {
 		entry = l.buffer.Append(entry)
 	}
-	if l.history != nil {
-		_ = l.history.Append(entry)
+	if l.history != nil && persist {
+		historyErr = l.history.Append(entry)
 	}
 	l.broadcast(entry)
 	l.mu.Unlock()
+	if level == "error" {
+		l.notifyErrorObservers(scope, msg, meta)
+	}
+	if historyErr != nil {
+		var rotateErr historyRotateError
+		if errors.As(historyErr, &rotateErr) {
+			l.reportHistoryFailure("consoleLogHistoryRotateFailed", "console log history rotate failed", rotateErr.err)
+		} else {
+			l.reportHistoryFailure("consoleLogHistoryWriteFailed", "console log history write failed", historyErr)
+		}
+	}
 	if !l.Enabled(level) {
 		return
 	}
@@ -705,7 +867,7 @@ func (h *logHistory) Append(entry LogEntry) error {
 	}
 	if h.entryCount >= h.entriesPerFile {
 		if err := h.rotateLocked(); err != nil {
-			return err
+			return historyRotateError{err: err}
 		}
 	}
 	b, err := json.Marshal(entry)
@@ -716,9 +878,11 @@ func (h *logHistory) Append(entry LogEntry) error {
 		return err
 	}
 	if _, err := h.writer.Write(b); err != nil {
+		h.discardWriterLocked()
 		return err
 	}
 	if err := h.writer.WriteByte('\n'); err != nil {
+		h.discardWriterLocked()
 		return err
 	}
 	h.entryCount++
@@ -754,8 +918,15 @@ func (h *logHistory) flushLoop() {
 				h.mu.Unlock()
 				return
 			}
-			_ = h.flushWriterLocked()
+			err := h.flushWriterLocked()
+			if err != nil {
+				h.discardWriterLocked()
+			}
+			onError := h.onFlushError
 			h.mu.Unlock()
+			if err != nil && onError != nil {
+				onError(err)
+			}
 		case <-h.done:
 			return
 		}
@@ -783,6 +954,16 @@ func (h *logHistory) flushWriterLocked() error {
 		return err
 	}
 	return nil
+}
+
+// discardWriterLocked 丢掉出过错的写入器。bufio.Writer 一旦写失败就永久处于错误状态，
+// 不丢掉的话磁盘恢复后也写不进去；缓冲里的内容此时已经写不出去了。下一次 Append 会重新打开文件。
+func (h *logHistory) discardWriterLocked() {
+	h.writer = nil
+	if h.file != nil {
+		_ = h.file.Close()
+		h.file = nil
+	}
 }
 
 func (h *logHistory) closeWriterLocked() error {

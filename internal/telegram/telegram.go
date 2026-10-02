@@ -26,6 +26,16 @@ func New(store *storage.Store, log *logging.Logger) *Service {
 	return &Service{store: store, log: log, http: &http.Client{Timeout: 12 * time.Second}}
 }
 
+// SetHTTPClient 替换发送消息用的 HTTP 客户端，主要供测试拦截 Telegram 接口。
+func (s *Service) SetHTTPClient(client *http.Client) {
+	if s != nil && client != nil {
+		s.http = client
+	}
+}
+
+// TestMessage 是面板上「发送测试」默认发出的内容，只用来确认通知渠道能送达。
+const TestMessage = "✅ 通知测试：EmbyProxy 可以通过这个渠道联系到你"
+
 func (s *Service) Send(ctx context.Context, cfg storage.TGConfig, text string) bool {
 	token := strings.TrimSpace(cfg.Token)
 	chat := strings.TrimSpace(cfg.Chat)
@@ -67,7 +77,11 @@ func (s *Service) BuildReport(ctx context.Context, now int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	reportTime := cfg.ReportTime
+	return s.BuildReportFor(ctx, cfg.ReportTime, now)
+}
+
+// BuildReportFor 按给定的日报推送时间生成日报，面板试发时用尚未保存的表单值。
+func (s *Service) BuildReportFor(ctx context.Context, reportTime string, now int64) (string, error) {
 	if reportTime == "" {
 		reportTime = "00:00"
 	}
@@ -226,101 +240,6 @@ func appendComparison(lines []string, current, previous summary, includeErrors b
 
 func formatReportRange(start, end time.Time) string {
 	return start.Format("2006-01-02 15:04") + " 至 " + end.Format("2006-01-02 15:04")
-}
-
-func (s *Service) CheckKeepaliveAndNotify(ctx context.Context) error {
-	cfg, err := s.store.GetTGConfig(ctx)
-	if err != nil || !cfg.Enabled || cfg.Token == "" || cfg.Chat == "" {
-		return err
-	}
-	now := time.Now().UnixMilli()
-	day := storage.BeijingDate(now)
-	hhmm := storage.BeijingHHMM(now)
-	nodes, err := s.store.ListNodes(ctx, "admin")
-	if err != nil {
-		return err
-	}
-	states, err := s.store.GetAllKeepaliveStates(ctx)
-	if err != nil {
-		return err
-	}
-	stateMap := map[string]storage.KeepaliveState{}
-	for _, state := range states {
-		stateMap[state.Node] = state
-	}
-	for _, node := range nodes {
-		if node.RenewDays <= 0 {
-			continue
-		}
-		state := stateMap["admin:"+node.Name]
-		lastPlayTS := state.LastPlayTS
-		if lastPlayTS == 0 {
-			lastPlayTS = state.AnchorTS
-		}
-		dueTS := lastPlayTS + int64(node.RenewDays)*86400000
-		remindFromTS := dueTS - int64(node.RemindBeforeDays)*86400000
-		if now < remindFromTS {
-			continue
-		}
-		keepaliveAt := node.KeepaliveAt
-		if keepaliveAt == "" {
-			keepaliveAt = "00:00"
-		}
-		if hhmm < keepaliveAt {
-			continue
-		}
-		maxPerDay := node.KeepaliveMaxPerDay
-		if maxPerDay <= 0 {
-			maxPerDay = 1
-		}
-		notifyCount := 0
-		if state.NotifyCountDay == day {
-			notifyCount = state.NotifyCount
-		}
-		if notifyCount >= maxPerDay {
-			continue
-		}
-		kv := s.store.KV()
-		lastNotifyKey := "keepalive:last:admin:" + node.Name + ":" + day
-		lastNotifyTS := int64Value(mustKVGet(ctx, kv, lastNotifyKey))
-		if lastNotifyTS > 0 && now-lastNotifyTS < 60*60000 {
-			continue
-		}
-		daysLeft := int((dueTS - now + 86400000 - 1) / 86400000)
-		if daysLeft < 0 {
-			daysLeft = 0
-		}
-		lastPlay := "从未"
-		if lastPlayTS > 0 {
-			lastPlay = localtime.FormatUnixMilli(lastPlayTS, "2006-01-02 15:04")
-		}
-		display := node.DisplayName
-		if display == "" {
-			display = node.Name
-		}
-		lines := []string{
-			"保号提醒：" + display,
-			"节点：" + node.Name,
-			fmt.Sprintf("保号周期：%d 天", node.RenewDays),
-			fmt.Sprintf("到期还剩：%d 天", daysLeft),
-			"上次播放：" + lastPlay,
-		}
-		digestKey := "keepalive:digest:admin:" + node.Name + ":" + day
-		digest := storage.FNV1a(strings.Join([]string{node.Name, strconv.Itoa(node.RenewDays), strconv.Itoa(node.RemindBeforeDays), strconv.FormatInt(dueTS, 10), strconv.FormatInt(lastPlayTS, 10)}, "|"))
-		prevDigest := mustKVGet(ctx, kv, digestKey)
-		if node.KeepaliveChangeOnly && prevDigest == digest {
-			continue
-		}
-		if !s.Send(ctx, cfg, strings.Join(lines, "\n")) {
-			s.log.Warn("telegram", "keepalive send failed", map[string]any{"event": "keepaliveSendFailed", "node": node.Name, "day": day})
-			continue
-		}
-		_ = kv.Put(ctx, lastNotifyKey, strconv.FormatInt(now, 10))
-		_ = kv.Put(ctx, digestKey, digest)
-		_ = s.store.UpdateKeepaliveNotify(ctx, "admin", node.Name, day, notifyCount+1, day)
-		s.log.Debug("telegram", "keepalive sent", map[string]any{"event": "keepaliveSent", "node": node.Name, "day": day, "count": notifyCount + 1})
-	}
-	return nil
 }
 
 type summary struct {

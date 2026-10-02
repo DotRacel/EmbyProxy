@@ -40,7 +40,7 @@ type Sample struct {
 	Err    string `json:"err,omitempty"`
 }
 
-// TargetStats 单条上游线路的最新探测结果。
+// TargetStats 单条上游线路的最新探测结果，以及最近 Retention 窗口内的可用率与平均延迟。
 type TargetStats struct {
 	Target  string `json:"target"`
 	At      int64  `json:"at,omitempty"`
@@ -50,6 +50,11 @@ type TargetStats struct {
 	Err     string `json:"err,omitempty"`
 	Primary bool   `json:"primary"`
 	Samples int    `json:"samples"`
+	// OKSamples 窗口内成功样本数；Availability = OKSamples / Samples，没有样本时为 0。
+	OKSamples    int     `json:"okSamples"`
+	Availability float64 `json:"availability"`
+	// AvgMS 成功样本的平均延迟，没有成功样本时为 0。
+	AvgMS int64 `json:"avgMs"`
 }
 
 // NodeStats 节点的探测概况，对应设计稿里列表卡片与详情页头部的指标。
@@ -67,13 +72,26 @@ type NodeStats struct {
 	MaxMS        int64         `json:"maxMs"`
 	Spark        []int64       `json:"spark"`
 	Targets      []TargetStats `json:"targets"`
+	// ActiveTarget 代理当前实际转发到的上游线路，还没有请求经过或不认识时为空。
+	// 由 admin 从代理的路由状态里填，探测本身不知道这个值。
+	ActiveTarget string `json:"activeTarget"`
 }
 
-// Point 延迟曲线上的一个时间桶。MS 为 -1 表示该区间没有成功样本。
+// Point 延迟曲线上的一个时间桶。MS 为 -1 表示该区间没有成功样本；
+// N 是桶内样本总数，N 为 0 是「无采样」，N > 0 且 OK 为 0 才是「全部失败」。
 type Point struct {
-	At int64   `json:"at"`
-	MS int64   `json:"ms"`
-	OK float64 `json:"ok"`
+	At  int64   `json:"at"`
+	MS  int64   `json:"ms"`
+	OK  float64 `json:"ok"`
+	N   int     `json:"n"`
+	Err string  `json:"err,omitempty"`
+}
+
+// TargetSeries 单条上游线路的延迟曲线，与节点整体曲线共用同一组时间桶。
+type TargetSeries struct {
+	Target  string  `json:"target"`
+	Primary bool    `json:"primary"`
+	Points  []Point `json:"points"`
 }
 
 type series struct {
@@ -239,6 +257,7 @@ func (r *Registry) Stats(name string, targets []string) NodeStats {
 		out.Spark = spark(samples, SparkPoints)
 	}
 
+	since := time.Now().Add(-Retention).UnixMilli()
 	byTarget := r.targets[name]
 	for i, target := range targets {
 		if i >= targetLimit {
@@ -252,17 +271,39 @@ func (r *Registry) Stats(name string, targets []string) NodeStats {
 			stat.Status = last.Status
 			stat.OK = last.OK
 			stat.Err = last.Err
-			stat.Samples = len(s.samples)
+			window := s.window(since)
+			stat.Samples = len(window)
+			sum := int64(0)
+			for _, v := range window {
+				if v.OK {
+					stat.OKSamples++
+					sum += v.MS
+				}
+			}
+			if stat.Samples > 0 {
+				stat.Availability = float64(stat.OKSamples) / float64(stat.Samples)
+			}
+			if stat.OKSamples > 0 {
+				stat.AvgMS = sum / int64(stat.OKSamples)
+			}
 		}
 		out.Targets = append(out.Targets, stat)
 	}
 	return out
 }
 
-// Series 把最近 window 时长内的样本压成 buckets 个等宽时间桶，供前端画延迟曲线。
+// Series 把最近 window 时长内的节点整体样本压成 buckets 个等宽时间桶，供前端画延迟曲线。
 func (r *Registry) Series(name string, window time.Duration, buckets int) []Point {
+	points, _ := r.SeriesWithTargets(name, nil, window, buckets)
+	return points
+}
+
+// SeriesWithTargets 同时给出节点整体曲线与各上游线路的曲线，所有曲线共用同一组时间桶。
+// targets 按配置顺序给出，第一条为主线，超过 targetLimit 的部分忽略；为空时只算整体曲线。
+func (r *Registry) SeriesWithTargets(name string, targets []string, window time.Duration, buckets int) ([]Point, []TargetSeries) {
+	lines := []TargetSeries{}
 	if r == nil || buckets <= 0 || window <= 0 {
-		return []Point{}
+		return []Point{}, lines
 	}
 	if window > Retention {
 		window = Retention
@@ -276,11 +317,31 @@ func (r *Registry) Series(name string, window time.Duration, buckets int) []Poin
 
 	r.mu.RLock()
 	samples := append([]Sample(nil), r.nodes[name].window(since)...)
+	byTarget := make([][]Sample, 0, len(targets))
+	for i, target := range targets {
+		if i >= targetLimit {
+			break
+		}
+		byTarget = append(byTarget, append([]Sample(nil), r.targets[name][target].window(since)...))
+	}
 	r.mu.RUnlock()
 
+	for i, targetSamples := range byTarget {
+		lines = append(lines, TargetSeries{
+			Target:  targets[i],
+			Primary: i == 0,
+			Points:  bucketize(targetSamples, since, span, buckets),
+		})
+	}
+	return bucketize(samples, since, span, buckets), lines
+}
+
+// bucketize 把按时间升序的样本归进从 since 开始、宽 span 的 buckets 个桶。
+func bucketize(samples []Sample, since, span int64, buckets int) []Point {
 	sums := make([]int64, buckets)
 	okCounts := make([]int, buckets)
 	totals := make([]int, buckets)
+	errs := make([]string, buckets)
 	for _, s := range samples {
 		idx := int((s.At - since) / span)
 		if idx < 0 {
@@ -293,12 +354,17 @@ func (r *Registry) Series(name string, window time.Duration, buckets int) []Poin
 		if s.OK {
 			okCounts[idx]++
 			sums[idx] += s.MS
+			continue
+		}
+		// 样本按时间升序，后来的覆盖先来的，留下的就是桶内最近一次失败的原因。
+		if s.Err != "" {
+			errs[idx] = s.Err
 		}
 	}
 
 	points := make([]Point, 0, buckets)
 	for i := 0; i < buckets; i++ {
-		p := Point{At: since + int64(i)*span, MS: -1}
+		p := Point{At: since + int64(i)*span, MS: -1, N: totals[i], Err: errs[i]}
 		if okCounts[i] > 0 {
 			p.MS = sums[i] / int64(okCounts[i])
 		}
@@ -353,12 +419,23 @@ func spark(samples []Sample, points int) []int64 {
 	return out
 }
 
+// Observer 接收每次节点探测的整体结果，节点故障告警据此判断宕机与恢复。
+// 回调发生在探测 goroutine 里（手动「检测」时是请求 goroutine），实现必须立刻返回。
+type Observer interface {
+	// ObserveNode 在一个节点探测完后调用。sample 是节点整体样本，target 是给出它的线路：
+	// 有可用线路时是第一条可用线路，全部失败时是最后一条。未配置上游的节点不会回调。
+	ObserveNode(node storage.Node, sample Sample, target string)
+	// RetainNodes 在每轮全量探测开始时给出当前存在的节点，用来丢掉已删除或改名节点的状态。
+	RetainNodes(names []string)
+}
+
 // Prober 按 Interval 周期探测所有节点的上游线路。
 type Prober struct {
 	registry *Registry
 	store    *storage.Store
 	log      *logging.Logger
 	client   *http.Client
+	observer Observer
 }
 
 func NewProber(registry *Registry, store *storage.Store, log *logging.Logger) *Prober {
@@ -367,6 +444,13 @@ func NewProber(registry *Registry, store *storage.Store, log *logging.Logger) *P
 		store:    store,
 		log:      log,
 		client:   &http.Client{Timeout: ProbeTimeout},
+	}
+}
+
+// SetObserver 绑定节点探测结果的观察者，需在 Start 之前调用。
+func (p *Prober) SetObserver(o Observer) {
+	if p != nil {
+		p.observer = o
 	}
 }
 
@@ -425,6 +509,9 @@ func (p *Prober) ProbeAll(ctx context.Context) {
 		names = append(names, node.Name)
 	}
 	p.registry.Retain(names)
+	if p.observer != nil {
+		p.observer.RetainNodes(names)
+	}
 	if err := p.store.RetainProbeSamples(ctx, names); err != nil && p.log != nil {
 		p.log.Debug("probe", "retain samples failed", map[string]any{"event": "probeRetainFailed", "error": err.Error()})
 	}
@@ -455,7 +542,8 @@ func (p *Prober) persist(ctx context.Context, samples []storage.ProbeSample) {
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := p.store.AppendProbeSamples(writeCtx, samples); err != nil && p.log != nil {
-		p.log.Debug("probe", "persist samples failed", map[string]any{"event": "probePersistFailed", "error": err.Error()})
+		// 每轮一次，加上手动「检测」时每个节点一次，节流后报 ERROR。
+		p.log.ErrorThrottled(time.Minute, "probe", "persist samples failed", map[string]any{"event": "probePersistFailed", "error": err.Error()})
 	}
 }
 
@@ -474,6 +562,7 @@ func (p *Prober) probeNode(ctx context.Context, node storage.Node) (Sample, []st
 		targets = targets[:targetLimit]
 	}
 	var nodeSample Sample
+	nodeTarget := ""
 	found := false
 	rows := make([]storage.ProbeSample, 0, len(targets)+1)
 	for _, target := range targets {
@@ -482,10 +571,12 @@ func (p *Prober) probeNode(ctx context.Context, node storage.Node) (Sample, []st
 		rows = append(rows, storeSample(node.Name, target, sample))
 		if !found && sample.OK {
 			nodeSample = sample
+			nodeTarget = target
 			found = true
 		}
 		if !found {
 			nodeSample = sample
+			nodeTarget = target
 		}
 	}
 	if len(targets) == 0 {
@@ -493,6 +584,10 @@ func (p *Prober) probeNode(ctx context.Context, node storage.Node) (Sample, []st
 	}
 	p.registry.RecordNode(node.Name, nodeSample)
 	rows = append(rows, storeSample(node.Name, "", nodeSample))
+	// ctx 已取消时（停机、浏览器关掉了检测请求）样本都是「已取消」，不能算成节点故障。
+	if p.observer != nil && len(targets) > 0 && ctx.Err() == nil {
+		p.observer.ObserveNode(node, nodeSample, nodeTarget)
+	}
 	return nodeSample, rows
 }
 

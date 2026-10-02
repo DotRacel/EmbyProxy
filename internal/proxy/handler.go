@@ -837,7 +837,8 @@ func (h *Handler) recordPlaybackState(ctx context.Context, in storage.PlaybackIn
 	defer cancel()
 	if err := h.store.LogPlayback(writeCtx, in); err != nil {
 		if h.log != nil {
-			h.log.Warn("playback", "playback state write failed", map[string]any{"event": "playbackStateWriteFailed", "error": err.Error()})
+			// 数据库坏了时每个播放进度上报都会失败，节流后再报 ERROR。
+			h.log.ErrorThrottled(time.Minute, "playback", "playback state write failed", map[string]any{"event": "playbackStateWriteFailed", "error": err.Error()})
 		}
 		return
 	}
@@ -1658,6 +1659,23 @@ func mustParseRawBlockedIPPrefixes(values []string) []netip.Prefix {
 
 func (h *Handler) isSTRM(path string) bool {
 	return strmExtRE.MatchString(path)
+}
+
+// ActiveTarget 返回节点当前实际转发到的上游线路，供面板展示。键与 handleNode 里的
+// nodeKey 一致（uid + ":" + 小写节点名）。还没有请求经过、或记录的线路已不在 targets
+// 里时返回空串；只读，不会像 getActiveTarget 那样顺手写入默认值。
+func (h *Handler) ActiveTarget(uid, name string, targets []string) string {
+	if h == nil {
+		return ""
+	}
+	key := strings.TrimSpace(uid + ":" + strings.ToLower(strings.TrimSpace(name)))
+	h.activeMu.Lock()
+	active := h.activeTarget[key]
+	h.activeMu.Unlock()
+	if active == "" || !contains(targets, active) {
+		return ""
+	}
+	return active
 }
 
 func (h *Handler) getActiveTarget(nodeKey string, targets []string) string {

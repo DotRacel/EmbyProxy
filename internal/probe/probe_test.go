@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -243,5 +244,173 @@ func TestProbeAllDropsSamplesOfRemovedNodes(t *testing.T) {
 		if s.Node == "removed" {
 			t.Fatalf("removed node still has samples: %+v", samples)
 		}
+	}
+}
+
+func TestRegistryStatsReportsPerTargetAvailabilityAndAverage(t *testing.T) {
+	reg := NewRegistry()
+	now := time.Now().UnixMilli()
+	target := "https://v1.example.com"
+	reg.RecordTarget("uhdnow", target, Sample{At: now - 3000, MS: 100, Status: 200, OK: true})
+	reg.RecordTarget("uhdnow", target, Sample{At: now - 2000, MS: 8000, Err: "超时"})
+	reg.RecordTarget("uhdnow", target, Sample{At: now - 1000, MS: 300, Status: 200, OK: true})
+	reg.RecordTarget("uhdnow", target, Sample{At: now, MS: 0, Err: "拒绝连接"})
+
+	stats := reg.Stats("uhdnow", []string{target, "https://v2.example.com"})
+	got := stats.Targets[0]
+	if got.Samples != 4 || got.OKSamples != 2 {
+		t.Fatalf("samples = %d ok = %d, want 4 and 2", got.Samples, got.OKSamples)
+	}
+	if got.Availability != 0.5 {
+		t.Fatalf("Availability = %v, want 0.5", got.Availability)
+	}
+	if got.AvgMS != 200 {
+		t.Fatalf("AvgMS = %d, want 200 (failed samples excluded)", got.AvgMS)
+	}
+	if got.OK || got.Err != "拒绝连接" {
+		t.Fatalf("latest sample should drive ok/err: %+v", got)
+	}
+	// 没有样本的线路三个新字段都是 0。
+	if empty := stats.Targets[1]; empty.Availability != 0 || empty.OKSamples != 0 || empty.AvgMS != 0 {
+		t.Fatalf("unprobed target = %+v", empty)
+	}
+	if stats.ActiveTarget != "" {
+		t.Fatalf("ActiveTarget = %q, want empty (filled by admin)", stats.ActiveTarget)
+	}
+}
+
+func TestRegistrySeriesCountsSamplesAndKeepsLatestError(t *testing.T) {
+	reg := NewRegistry()
+	now := time.Now().UnixMilli()
+	reg.RecordNode("uhdnow", Sample{At: now - 3000, MS: 0, Err: "超时"})
+	reg.RecordNode("uhdnow", Sample{At: now - 2000, MS: 0, Err: "拒绝连接"})
+	reg.RecordNode("uhdnow", Sample{At: now - 1000, MS: 120, OK: true})
+
+	points := reg.Series("uhdnow", time.Hour, 12)
+	last := points[len(points)-1]
+	if last.N != 3 || last.Err != "拒绝连接" || last.MS != 120 {
+		t.Fatalf("last bucket = %+v, want n=3 err=拒绝连接 ms=120", last)
+	}
+	// 无采样（n=0）与全部失败（n>0 且 ok=0）必须能区分开。
+	if points[0].N != 0 || points[0].Err != "" {
+		t.Fatalf("empty bucket = %+v", points[0])
+	}
+
+	reg.RecordNode("down", Sample{At: now - 500, Err: "超时"})
+	if p := reg.Series("down", time.Hour, 12)[11]; p.N != 1 || p.OK != 0 || p.MS != -1 || p.Err != "超时" {
+		t.Fatalf("failed bucket = %+v", p)
+	}
+}
+
+func TestRegistrySeriesWithTargetsFollowsConfiguredOrder(t *testing.T) {
+	reg := NewRegistry()
+	now := time.Now().UnixMilli()
+	reg.RecordNode("uhdnow", Sample{At: now - 500, MS: 90, OK: true})
+	reg.RecordTarget("uhdnow", "https://b.example.com", Sample{At: now - 500, MS: 90, OK: true})
+	reg.RecordTarget("uhdnow", "https://a.example.com", Sample{At: now - 500, Err: "超时"})
+
+	targets := []string{"https://a.example.com", "https://b.example.com"}
+	for i := 0; i < targetLimit; i++ {
+		targets = append(targets, "https://extra"+string(rune('a'+i))+".example.com")
+	}
+	points, lines := reg.SeriesWithTargets("uhdnow", targets, time.Hour, 12)
+	if len(points) != 12 {
+		t.Fatalf("len(points) = %d, want 12", len(points))
+	}
+	if len(lines) != targetLimit {
+		t.Fatalf("len(lines) = %d, want targetLimit %d", len(lines), targetLimit)
+	}
+	if lines[0].Target != "https://a.example.com" || !lines[0].Primary || lines[1].Primary {
+		t.Fatalf("lines order/primary = %+v, %+v", lines[0], lines[1])
+	}
+	if p := lines[0].Points[11]; p.N != 1 || p.OK != 0 || p.Err != "超时" {
+		t.Fatalf("primary last bucket = %+v", p)
+	}
+	if p := lines[1].Points[11]; p.N != 1 || p.MS != 90 {
+		t.Fatalf("secondary last bucket = %+v", p)
+	}
+	// 各曲线共用同一组时间桶。
+	if lines[0].Points[0].At != points[0].At || lines[1].Points[11].At != points[11].At {
+		t.Fatal("per-target series must share bucket boundaries with the node series")
+	}
+	if _, none := reg.SeriesWithTargets("uhdnow", nil, time.Hour, 12); none == nil || len(none) != 0 {
+		t.Fatalf("no targets should give an empty (non-nil) slice, got %#v", none)
+	}
+}
+
+type recordingObserver struct {
+	nodes    []string
+	targets  []string
+	samples  []Sample
+	retained [][]string
+}
+
+func (o *recordingObserver) ObserveNode(node storage.Node, sample Sample, target string) {
+	o.nodes = append(o.nodes, node.Name)
+	o.targets = append(o.targets, target)
+	o.samples = append(o.samples, sample)
+}
+
+func (o *recordingObserver) RetainNodes(names []string) {
+	o.retained = append(o.retained, append([]string(nil), names...))
+}
+
+func TestProberReportsNodeResultsToObserver(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer down.Close()
+
+	ctx := t.Context()
+	store, err := storage.New(filepath.Join(t.TempDir(), "probe.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	// 主线挂了、备线可用：节点整体样本应来自备线。
+	if err := store.SaveNode(ctx, "admin", storage.Node{Name: "failover", Target: down.URL + "\n" + up.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveNode(ctx, "admin", storage.Node{Name: "dead", Target: down.URL}); err != nil {
+		t.Fatal(err)
+	}
+
+	obs := &recordingObserver{}
+	p := NewProber(NewRegistry(), store, nil)
+	p.SetObserver(obs)
+	p.ProbeAll(ctx)
+
+	if len(obs.retained) != 1 || len(obs.retained[0]) != 2 {
+		t.Fatalf("retained = %v, want one call with both nodes", obs.retained)
+	}
+	got := map[string]int{}
+	for i, name := range obs.nodes {
+		got[name] = i
+	}
+	i := got["failover"]
+	if !obs.samples[i].OK || obs.targets[i] != up.URL {
+		t.Fatalf("failover result = %+v via %q, want ok via backup", obs.samples[i], obs.targets[i])
+	}
+	i = got["dead"]
+	if obs.samples[i].OK || obs.targets[i] != down.URL || obs.samples[i].Status != http.StatusBadGateway {
+		t.Fatalf("dead result = %+v via %q", obs.samples[i], obs.targets[i])
+	}
+
+	// 取消的 ctx 下样本都是「已取消」，不应交给告警。
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	before := len(obs.nodes)
+	p.ProbeNode(cancelled, storage.Node{Name: "dead", Target: down.URL})
+	if len(obs.nodes) != before {
+		t.Fatal("cancelled probes must not be observed")
+	}
+	// 没配上游的节点永远不告警。
+	p.ProbeNode(ctx, storage.Node{Name: "empty"})
+	if len(obs.nodes) != before {
+		t.Fatal("nodes without targets must not be observed")
 	}
 }

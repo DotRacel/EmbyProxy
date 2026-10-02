@@ -105,14 +105,6 @@ func (s *Store) InitSchema(ctx context.Context) error {
 			v TEXT NOT NULL,
 			updated_at INTEGER NOT NULL
 		);
-		CREATE TABLE IF NOT EXISTS keepalive_state (
-			node TEXT PRIMARY KEY,
-			anchor_ts INTEGER NOT NULL,
-			last_play_ts INTEGER DEFAULT 0,
-			last_notify_day TEXT,
-			notify_count_day TEXT,
-			notify_count INTEGER DEFAULT 0
-		);
 		CREATE TABLE IF NOT EXISTS play_sessions (
 			k TEXT PRIMARY KEY,
 			day TEXT NOT NULL,
@@ -181,7 +173,29 @@ func (s *Store) InitSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := s.dropKeepaliveLeftovers(ctx); err != nil {
+		return err
+	}
 	return s.ensurePlaybackStatColumns(ctx)
+}
+
+// dropKeepaliveLeftovers 清掉已移除的保号提醒留下的表和 KV 记录。
+// 只在 keepalive_state 表还在时动手，所以每个库只会真正执行一次。
+func (s *Store) dropKeepaliveLeftovers(ctx context.Context) error {
+	var name string
+	err := s.db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'keepalive_state'`).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `DROP TABLE IF EXISTS keepalive_state`); err != nil {
+		return err
+	}
+	// keepalive:last:* / keepalive:digest:* 是按天写的提醒去重标记，只有保号提醒会读。
+	_, err = s.db.ExecContext(ctx, `DELETE FROM proxy_kv WHERE k LIKE 'keepalive:%'`)
+	return err
 }
 
 func (s *Store) ensurePlaybackStatColumns(ctx context.Context) error {
@@ -382,13 +396,6 @@ func (s *Store) SaveNode(ctx context.Context, uid string, node Node) error {
 	if err := s.KV().Put(ctx, "u:"+uid+":node:"+node.Name, packed); err != nil {
 		return err
 	}
-	now := time.Now().UnixMilli()
-	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO keepalive_state (node, anchor_ts) VALUES (?, ?)
-		ON CONFLICT(node) DO NOTHING
-	`, uid+":"+node.Name, now); err != nil {
-		return err
-	}
 	s.InvalidateNodeCache(uid, node.Name)
 	return nil
 }
@@ -398,7 +405,8 @@ func (s *Store) DeleteNode(ctx context.Context, uid, name string) error {
 	if err := s.KV().Delete(ctx, "u:"+uid+":node:"+name); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM keepalive_state WHERE node = ?`, uid+":"+name); err != nil {
+	// 删除或改名后旧名字的故障状态就没有意义了，留着会让同名新节点一上来就被当成故障中。
+	if err := s.DeleteNodeAlertState(ctx, uid, name); err != nil {
 		return err
 	}
 	s.InvalidateNodeCache(uid, name)
@@ -436,21 +444,26 @@ func (s *Store) GetHostIndex(ctx context.Context, uid string) (map[string]HostMa
 	return out, nil
 }
 
+// GetTGConfig 读取通知配置。解码前先铺上 DefaultTGConfig，老配置里缺的字段
+// （比如告警开关）保持默认值而不是零值。
 func (s *Store) GetTGConfig(ctx context.Context) (TGConfig, error) {
-	var cfg TGConfig
+	cfg := DefaultTGConfig()
 	value, ok, err := s.KV().Get(ctx, "tg:config")
 	if err != nil || !ok {
-		return TGConfig{Enabled: false}, err
+		return DefaultTGConfig(), err
 	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(value), &raw); err != nil {
-		return TGConfig{Enabled: false}, nil
+		return DefaultTGConfig(), nil
 	}
 	if err := json.Unmarshal([]byte(value), &cfg); err != nil {
-		return TGConfig{Enabled: false}, nil
+		return DefaultTGConfig(), nil
 	}
 	if _, ok := raw["reportEnabled"]; !ok && cfg.Enabled {
 		cfg.ReportEnabled = true
+	}
+	if cfg.AlertFailThreshold < MinAlertFailThreshold || cfg.AlertFailThreshold > MaxAlertFailThreshold {
+		cfg.AlertFailThreshold = DefaultAlertFailThreshold
 	}
 	return cfg, nil
 }

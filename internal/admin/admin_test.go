@@ -54,8 +54,8 @@ func TestServeAdminValidatesTokenConfig(t *testing.T) {
 }
 
 func TestAdminIndexIncludesTelegramRemark(t *testing.T) {
-	if !strings.Contains(indexHTML, `id="tg-serverRemark" maxlength="80"`) {
-		t.Fatal("indexHTML missing Telegram server remark input")
+	if !strings.Contains(adminSource, `id="tg-serverRemark" maxlength="80"`) {
+		t.Fatal("admin frontend missing Telegram server remark input")
 	}
 }
 
@@ -92,16 +92,16 @@ func TestAdminIndexIncludesSortableStats(t *testing.T) {
 		`let statsSortKey = 'lastActivityAt';`,
 	}
 	for _, want := range wants {
-		if !strings.Contains(indexHTML, want) {
-			t.Fatalf("indexHTML missing %q", want)
+		if !strings.Contains(adminSource, want) {
+			t.Fatalf("adminSource missing %q", want)
 		}
 	}
 	// 「日期」列已经和「最近活动」重复，表头被删掉；day 只作为隐式排序回退保留。
-	if strings.Contains(indexHTML, `data-stats-sort="day"`) {
-		t.Fatal("indexHTML still renders the removed 日期 column")
+	if strings.Contains(adminSource, `data-stats-sort="day"`) {
+		t.Fatal("adminSource still renders the removed 日期 column")
 	}
-	if !strings.Contains(indexHTML, `['day', 'desc']`) {
-		t.Fatal("indexHTML lost the day sort fallback")
+	if !strings.Contains(adminSource, `['day', 'desc']`) {
+		t.Fatal("adminSource lost the day sort fallback")
 	}
 }
 

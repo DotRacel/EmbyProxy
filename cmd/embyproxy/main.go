@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"embyproxy/internal/admin"
+	"embyproxy/internal/alert"
 	"embyproxy/internal/auth"
 	"embyproxy/internal/buildinfo"
 	"embyproxy/internal/capture"
@@ -76,8 +77,15 @@ func main() {
 	proxyHandler := proxy.New(cfg, store, ids, log)
 	adminHandler := admin.New(cfg, store, checker, tg, log, proxyHandler.ResetNodeRoutingState, proxyHandler)
 
+	adminHandler.AttachActiveTargets(proxyHandler.ActiveTarget)
+
+	// 告警要先于探测启动：探测的第一轮结果就要交给它，它也要先回填上次的故障状态。
+	alerts := alert.New(store, tg, log)
+	alerts.Start(ctx)
+
 	probeRegistry := probe.NewRegistry()
 	prober := probe.NewProber(probeRegistry, store, log)
+	prober.SetObserver(alerts)
 	adminHandler.AttachProbes(probeRegistry, prober)
 	prober.Start(ctx)
 
@@ -181,7 +189,7 @@ func applyRuntimeConfig(ctx context.Context, store *storage.Store, log *logging.
 	log.Configure(systemCfg.LogLevel, systemCfg.LogAccess)
 	entriesPerFile, maxFiles := systemCfg.LogHistoryLimits()
 	if err := log.ReconfigureHistory(entriesPerFile, maxFiles); err != nil {
-		log.Warn("startup", "console log history reconfigure failed", map[string]any{"event": "consoleLogHistoryReconfigureFailed", "error": err.Error()})
+		log.Error("startup", "console log history reconfigure failed", map[string]any{"event": "consoleLogHistoryReconfigureFailed", "error": err.Error()})
 	}
 }
 

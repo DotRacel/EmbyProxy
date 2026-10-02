@@ -379,14 +379,15 @@ func TestAuthRoutesSuppressTrafficCapture(t *testing.T) {
 
 func indexFunctionBlock(t *testing.T, startMarker, endMarker string) string {
 	t.Helper()
-	start := strings.Index(indexHTML, startMarker)
+	// 前端拆成了 index.html + static/assets 下的多个脚本，这里在拼接后的完整源码里查找。
+	start := strings.Index(adminSource, startMarker)
 	if start < 0 {
-		t.Fatalf("indexHTML missing function marker %q", startMarker)
+		t.Fatalf("admin frontend missing function marker %q", startMarker)
 	}
-	tail := indexHTML[start:]
+	tail := adminSource[start:]
 	end := strings.Index(tail, endMarker)
 	if end < 0 {
-		t.Fatalf("indexHTML function %q is incomplete", startMarker)
+		t.Fatalf("admin frontend function %q is incomplete", startMarker)
 	}
 	return tail[:end]
 }
@@ -424,18 +425,17 @@ func TestAdminIndexUsesConditionalTokenPersistenceAndTwoFactorUI(t *testing.T) {
 		`credentials: 'same-origin'`,
 	}
 	for _, want := range wants {
-		if !strings.Contains(indexHTML, want) {
-			t.Fatalf("indexHTML missing %q", want)
+		if !strings.Contains(adminSource, want) {
+			t.Fatalf("admin frontend missing %q", want)
 		}
 	}
-	if strings.Contains(indexHTML, `'Authorization': 'Bearer '`) {
-		t.Fatal("indexHTML still sends the saved admin token on every API request")
+	if strings.Contains(adminSource, `'Authorization': 'Bearer '`) {
+		t.Fatal("admin frontend still sends the saved admin token on every API request")
 	}
-	accessStart := strings.Index(indexHTML, `id="config-access"`)
-	cardStart := strings.Index(indexHTML, `id="twoFactorCard"`)
-	operationsStart := strings.Index(indexHTML, `id="config-ops"`)
-	if accessStart < 0 || cardStart < accessStart || operationsStart < cardStart {
-		t.Fatalf("2FA card is not inside the security settings group: access=%d card=%d operations=%d", accessStart, cardStart, operationsStart)
+	// 配置弹窗按标签页用模板渲染：2FA 卡片由 twoFactorCard() 生成，必须放在「安全访问」分组里。
+	security := indexFunctionBlock(t, `id="config-access"`, `id="config-ops"`)
+	if !strings.Contains(security, `twoFactorCard()`) {
+		t.Fatalf("2FA card is not inside the security settings group:\n%s", security)
 	}
 }
 
@@ -458,8 +458,8 @@ func TestAdminIndexOnlyClearsLocalStateAfterSuccessfulLogout(t *testing.T) {
 }
 
 func TestAdminIndexLoginGuards(t *testing.T) {
-	if !strings.Contains(indexHTML, `let authGeneration = 0;`) {
-		t.Fatal("indexHTML is missing the authentication generation")
+	if !strings.Contains(adminSource, `let authGeneration = 0;`) {
+		t.Fatal("admin frontend is missing the authentication generation")
 	}
 	restoreBlock := indexFunctionBlock(t, `async function restoreSession()`, "\n}\n\nasync function doLogin")
 	// 回车提交的监听已经统一挪到脚本末尾的「全局初始化」一节（原来 app 侧和登录侧各绑一次，会重复触发），
@@ -478,7 +478,7 @@ func TestAdminIndexLoginGuards(t *testing.T) {
 	})
 
 	t.Run("serialized submissions", func(t *testing.T) {
-		assertContainsAll(t, indexHTML, `id="loginButton"`, `let loginInFlight = false;`)
+		assertContainsAll(t, adminSource, `id="loginButton"`, `let loginInFlight = false;`)
 		assertOrdered(t, loginBlock,
 			`if (loginInFlight) return;`,
 			`loginInFlight = true;`,
@@ -493,7 +493,7 @@ func TestAdminIndexLoginGuards(t *testing.T) {
 
 func TestAdminIndexStopsProtectedUIAfterSessionFailure(t *testing.T) {
 	t.Run("reset protected UI", func(t *testing.T) {
-		showLogin := indexFunctionBlock(t, `function showLogin(message = '')`, "\n}\n\nfunction resetProtectedUI")
+		showLogin := indexFunctionBlock(t, `function showLogin(message = '')`, "\nfunction resetProtectedUI")
 		assertContainsAll(t, showLogin, `resetProtectedUI();`)
 	})
 
@@ -508,17 +508,17 @@ func TestAdminIndexStopsProtectedUIAfterSessionFailure(t *testing.T) {
 		{
 			name:         "config modal",
 			startMarker:  `async function openConfigModal()`,
-			endMarker:    "\n}\n\nfunction closeConfigModal",
+			endMarker:    "\n}\n\nfunction logHistoryHint",
 			statusGuard:  `if (!await refreshAuthStatus(false)) return;`,
 			failureGuard: `if (!r.ok || !r.config)`,
-			showModal:    `showModal('configModal')`,
+			showModal:    `renderConfigDialog();`,
 		},
 		{
 			name:         "Telegram modal",
 			startMarker:  `async function openTgModal()`,
-			endMarker:    "\n}\n\nfunction closeTgModal",
+			endMarker:    "\n}\n\nfunction tgPayload",
 			failureGuard: `if (!r.ok || !r.config)`,
-			showModal:    `showModal('tgModal')`,
+			showModal:    `renderNotifyDialog();`,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -538,7 +538,7 @@ func TestAdminIndexStopsProtectedUIAfterSessionFailure(t *testing.T) {
 }
 
 func TestAdminIndexIgnoresClosedTwoFactorResponses(t *testing.T) {
-	assertContainsAll(t, indexHTML, `id="twoFactorConfirmBtn"`, `let twoFactorFlowGeneration = 0;`)
+	assertContainsAll(t, adminSource, `id="twoFactorConfirmBtn"`, `let twoFactorFlowGeneration = 0;`)
 	closeBlock := indexFunctionBlock(t, `function closeTwoFactorModal()`, "\n}\n\nasync function submitTwoFactorReauth")
 	assertContainsAll(t, closeBlock, `twoFactorFlowGeneration++;`)
 
@@ -552,8 +552,8 @@ func TestAdminIndexIgnoresClosedTwoFactorResponses(t *testing.T) {
 		t.Fatalf("submitTwoFactorReauth() does not accept the rotated disable session before the modal guard:\n%s", submitBlock)
 	}
 
-	// confirmTwoFactorSetup 现在是脚本里最后一个函数，后面直接是「全局初始化」一节。
-	confirmBlock := indexFunctionBlock(t, `async function confirmTwoFactorSetup()`, "\n * 全局初始化")
+	// confirmTwoFactorSetup 是 settings.js 里最后一个函数，后面直接是「事件」一节。
+	confirmBlock := indexFunctionBlock(t, `async function confirmTwoFactorSetup()`, "\n * 事件")
 	if !strings.Contains(confirmBlock, `button.disabled = true;`) || !strings.Contains(confirmBlock, `flowGeneration !== twoFactorFlowGeneration`) {
 		t.Fatalf("confirmTwoFactorSetup() does not serialize or invalidate confirmation:\n%s", confirmBlock)
 	}

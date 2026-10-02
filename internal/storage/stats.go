@@ -161,7 +161,6 @@ func (s *Store) LogPlayback(ctx context.Context, in PlaybackInput) error {
 	}
 	now := playbackOccurredAt(in)
 	day := BeijingDate(now)
-	uid := "admin"
 	nodeName := strings.ToLower(strings.TrimSpace(in.Node.Name))
 	if nodeName == "" {
 		nodeName = "unknown"
@@ -239,13 +238,6 @@ func (s *Store) LogPlayback(ctx context.Context, in PlaybackInput) error {
 			}
 		}
 		return tx.Commit()
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO keepalive_state (node, anchor_ts, last_play_ts) VALUES (?, ?, ?)
-		ON CONFLICT(node) DO UPDATE SET last_play_ts = MAX(COALESCE(keepalive_state.last_play_ts, 0), excluded.last_play_ts)
-	`, uid+":"+nodeName, now, now); err != nil {
-		return err
 	}
 
 	sessionActivity := method == http.MethodPost && playbackStatusSuccessful(in.Status) && (sessionEvent == "progress" || sessionEvent == "stopped")
@@ -462,61 +454,6 @@ func (s *Store) getStatsForDay(ctx context.Context, day string) ([]PlayStat, err
 		out = append(out, stat)
 	}
 	return out, rows.Err()
-}
-
-func (s *Store) GetAllKeepaliveStates(ctx context.Context) ([]KeepaliveState, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT node, anchor_ts, last_play_ts, last_notify_day, notify_count_day, notify_count FROM keepalive_state`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []KeepaliveState{}
-	for rows.Next() {
-		var st KeepaliveState
-		var lastNotify, notifyDay sqlNullString
-		if err := rows.Scan(&st.Node, &st.AnchorTS, &st.LastPlayTS, &lastNotify, &notifyDay, &st.NotifyCount); err != nil {
-			return nil, err
-		}
-		st.LastNotifyDay = lastNotify.String
-		st.NotifyCountDay = notifyDay.String
-		out = append(out, st)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) UpdateKeepaliveNotify(ctx context.Context, uid, nodeName, day string, count int, lastNotifyDay string) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE keepalive_state SET notify_count_day = ?, notify_count = ?, last_notify_day = ?
-		WHERE node = ?
-	`, day, count, lastNotifyDay, uid+":"+nodeName)
-	return err
-}
-
-type sqlNullString struct {
-	String string
-	Valid  bool
-}
-
-func (s *sqlNullString) Scan(value any) error {
-	if value == nil {
-		s.String = ""
-		s.Valid = false
-		return nil
-	}
-	s.Valid = true
-	s.String = stringFromAny(value)
-	return nil
-}
-
-func stringFromAny(value any) string {
-	switch v := value.(type) {
-	case string:
-		return v
-	case []byte:
-		return string(v)
-	default:
-		return ""
-	}
 }
 
 func sessionPlayingEvent(raw string) string {

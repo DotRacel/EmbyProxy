@@ -1,0 +1,110 @@
+/* ============ 日志页（前缀 lv-） ============ */
+
+/* 页头：实时开关 + 连接状态 */
+.lv-live { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lv-live-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: var(--fs-sm); font-weight: 500; color: var(--text); cursor: pointer; white-space: nowrap; }
+.lv-live .status { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+
+/* 工具栏 */
+.lv-toolbar .lv-search { width: 260px; }
+.lv-select { width: 120px; }
+.lv-node { width: 160px; }
+.lv-pager { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.lv-page { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); }
+.lv-page .input { width: 64px; height: var(--h-sm); padding: 0 8px; font-size: var(--fs-xs); text-align: center; }
+.lv-page .input::-webkit-inner-spin-button { opacity: .4; }
+
+/* 主体：按请求视图由页面滚动；按行视图改为控制台自身滚动，便于判断是否停在底部 */
+.lv-body { position: relative; }
+.lv-body.is-line { overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr); padding-bottom: 20px; }
+.lv-lineview { position: relative; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr); }
+.lv-view[hidden] { display: none !important; }
+
+/* 按行：控制台 */
+.lv-console { overflow-y: auto; min-height: 0; padding: 6px 0; border-radius: var(--r-lg); border: 1px solid var(--line); background: var(--bg-sunken); font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; }
+.lv-line { display: grid; grid-template-columns: 64px 50px minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 2px 14px; }
+.lv-line:hover { background: rgba(255,255,255,.025); }
+.lv-line.is-error { background: rgba(240,100,108,.06); }
+.lv-line.is-warn { background: rgba(233,177,60,.05); }
+.lv-time { color: var(--text-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.lv-msg { color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; min-width: 0; }
+.lv-scope { color: var(--accent-strong); }
+.lv-console .lv-empty { padding: 48px 20px; font-family: var(--font-sans); }
+
+/* 等级标记：ERROR / WARN 用状态色，INFO 中性，DEBUG 更弱 */
+.lv-lvl { display: inline-flex; justify-content: center; align-items: center; height: 18px; padding: 0 5px; border-radius: var(--r-sm); font-family: var(--font-mono); font-size: 10.5px; font-weight: 500; letter-spacing: .02em; white-space: nowrap; }
+.lv-lvl.error { color: var(--bad); background: var(--bad-wash); }
+.lv-lvl.warn { color: var(--warn); background: var(--warn-wash); }
+.lv-lvl.info { color: var(--text-2); background: var(--idle-wash); }
+.lv-lvl.debug, .lv-lvl.silent { color: var(--text-3); background: transparent; box-shadow: inset 0 0 0 1px var(--line-strong); }
+
+/* HTTP 状态码 */
+.lv-code { display: inline-flex; align-items: center; justify-content: center; min-width: 40px; height: 22px; padding: 0 7px; border-radius: var(--r-sm); font-family: var(--font-mono); font-size: var(--fs-xs); font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
+.lv-msg .lv-code { min-width: 0; height: 17px; padding: 0 4px; font-size: 11px; vertical-align: 1px; }
+.lv-code.ok { color: var(--ok); background: var(--ok-wash); }
+.lv-code.warn { color: var(--warn); background: var(--warn-wash); }
+.lv-code.bad { color: var(--bad); background: var(--bad-wash); }
+.lv-code.idle { color: var(--text-2); background: var(--idle-wash); font-family: var(--font-sans); }
+
+/* 新日志浮标 */
+.lv-newbadge { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 2; height: 30px; padding: 0 14px; border-radius: var(--r-pill); border: 1px solid var(--accent-edge); background: var(--overlay); color: var(--accent-strong); font-size: var(--fs-xs); font-weight: 500; cursor: pointer; box-shadow: var(--shadow-pop); }
+.lv-newbadge:hover { background: var(--raised); }
+
+/* 按请求：卡片 */
+.lv-trace { display: grid; gap: 8px; align-content: start; }
+.lv-card { border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--panel); min-width: 0; }
+.lv-card.is-error { border-color: rgba(240,100,108,.35); }
+.lv-card-top { all: unset; box-sizing: border-box; width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto 14px; gap: 10px; align-items: center; padding: 10px 14px 4px; cursor: pointer; border-radius: var(--r-lg) var(--r-lg) 0 0; }
+.lv-card-top:focus-visible { box-shadow: var(--focus); }
+.lv-card-top:hover .lv-target { color: var(--accent-strong); }
+.lv-others .lv-card-top { padding-bottom: 10px; }
+.lv-target { font-size: var(--fs-sm); color: var(--text); overflow-wrap: anywhere; min-width: 0; }
+.lv-ms { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-2); white-space: nowrap; }
+.lv-card.is-error .lv-ms { color: var(--bad); }
+.lv-chev { width: 14px; height: 14px; color: var(--text-3); transition: transform .15s var(--ease); }
+.lv-card.is-open .lv-chev { transform: rotate(180deg); }
+.lv-card-meta { display: flex; flex-wrap: wrap; gap: 2px 14px; padding: 0 14px 10px; font-size: var(--fs-xs); color: var(--text-3); min-width: 0; }
+.lv-card-meta span { overflow-wrap: anywhere; min-width: 0; }
+.lv-card-meta .mono { font-size: 11.5px; }
+.lv-card-body { border-top: 1px solid var(--line); padding: 12px 14px; display: grid; gap: 10px; }
+.lv-extra { font-size: var(--fs-xs); color: var(--text-3); }
+.lv-card-actions { display: flex; gap: 4px; flex-wrap: wrap; margin-left: -8px; }
+
+/* 阶段耗时条 */
+.lv-bars { display: grid; gap: 6px; max-width: 560px; }
+.lv-bar { display: grid; grid-template-columns: 44px minmax(0, 1fr) 64px; gap: 10px; align-items: center; font-size: var(--fs-xs); }
+.lv-bar-name { color: var(--text-2); }
+.lv-bar-track { height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden; }
+.lv-bar-fill { display: block; height: 100%; border-radius: 3px; }
+.lv-bar-fill.start { background: var(--series-2); }
+.lv-bar-fill.final { background: var(--accent); }
+.lv-bar-fill.bad { background: var(--bad); }
+.lv-bar-val { font-family: var(--font-mono); color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* 卡片内的原始日志行 */
+.lv-items { display: grid; gap: 2px; padding: 8px 0; border-radius: var(--r-md); background: var(--bg-sunken); border: 1px solid var(--line); font-family: var(--font-mono); font-size: 12px; line-height: 1.5; max-height: 320px; overflow-y: auto; }
+.lv-item { display: grid; grid-template-columns: 64px 50px minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 1px 12px; }
+
+.lv-foot { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 10px 2px 0; font-size: var(--fs-xs); color: var(--text-3); }
+.lv-skel { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--panel); }
+.lv-trace > .lv-empty { padding-top: 56px; }
+
+/* 中等宽度：工具栏收窄 */
+.app:is([data-bp="mid"], [data-bp="tablet"]) .lv-toolbar .lv-search { width: 200px; }
+
+/* 手机 */
+.app[data-bp="phone"] .lv-live { order: 3; width: 100%; }
+.app[data-bp="phone"] .lv-toolbar .lv-search { width: 100%; flex: 1 1 100%; }
+.app[data-bp="phone"] .lv-select, .app[data-bp="phone"] .lv-node { width: auto; flex: 1 1 0; min-width: 0; }
+.app[data-bp="phone"] .lv-toolbar .grow { display: none; }
+.app[data-bp="phone"] .lv-pager { width: 100%; justify-content: space-between; }
+.app[data-bp="phone"] .lv-line, .app[data-bp="phone"] .lv-item { grid-template-columns: auto auto minmax(0, 1fr); gap: 2px 8px; padding-inline: 10px; }
+.app[data-bp="phone"] .lv-lvl { justify-self: start; }
+.app[data-bp="phone"] .lv-line .lv-msg, .app[data-bp="phone"] .lv-item .lv-msg { grid-column: 1 / -1; }
+.app[data-bp="phone"] .lv-card-top { padding-inline: 12px; gap: 6px 8px; grid-template-columns: auto minmax(0, 1fr) 14px; grid-template-areas: "code ms chev" "target target target"; }
+.app[data-bp="phone"] .lv-card-top .lv-code { grid-area: code; justify-self: start; }
+.app[data-bp="phone"] .lv-card-top .lv-ms { grid-area: ms; justify-self: end; }
+.app[data-bp="phone"] .lv-card-top .lv-chev { grid-area: chev; }
+.app[data-bp="phone"] .lv-card-top .lv-target { grid-area: target; }
+.app[data-bp="phone"] .lv-card-meta { padding-inline: 12px; }
+.app[data-bp="phone"] .lv-body.is-line { padding-bottom: 14px; }

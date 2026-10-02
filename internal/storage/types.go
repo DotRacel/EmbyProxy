@@ -12,21 +12,15 @@ import (
 )
 
 type Node struct {
-	Name                string `json:"name"`
-	Target              string `json:"target"`
-	Fav                 bool   `json:"fav"`
-	Secret              string `json:"secret"`
-	Tag                 string `json:"tag"`
-	DisplayName         string `json:"displayName"`
-	DirectExternal      bool   `json:"directExternal"`
-	RenewDays           int    `json:"renewDays"`
-	RemindBeforeDays    int    `json:"remindBeforeDays"`
-	KeepaliveAt         string `json:"keepaliveAt"`
-	KeepaliveMaxPerDay  int    `json:"keepaliveMaxPerDay"`
-	KeepaliveChangeOnly bool   `json:"keepaliveChangeOnly"`
-	Impersonate         bool   `json:"impersonate"`
-	ImpersonateProfile  string `json:"impersonateProfile"`
-	LastPlayAt          int64  `json:"lastPlayAt,omitempty"`
+	Name               string `json:"name"`
+	Target             string `json:"target"`
+	Fav                bool   `json:"fav"`
+	Secret             string `json:"secret"`
+	Tag                string `json:"tag"`
+	DisplayName        string `json:"displayName"`
+	DirectExternal     bool   `json:"directExternal"`
+	Impersonate        bool   `json:"impersonate"`
+	ImpersonateProfile string `json:"impersonateProfile"`
 }
 
 type TGConfig struct {
@@ -36,6 +30,43 @@ type TGConfig struct {
 	ServerRemark  string `json:"serverRemark"`
 	ReportEnabled bool   `json:"reportEnabled"`
 	ReportTime    string `json:"reportTime"`
+	// AlertNodes 节点故障/恢复告警，AlertErrors 程序内部错误告警。
+	// 老配置里没有这几个字段，GetTGConfig 会保留 DefaultTGConfig 的默认值（开启），
+	// 不会被解析成 false。
+	AlertNodes  bool `json:"alertNodes"`
+	AlertErrors bool `json:"alertErrors"`
+	// AlertFailThreshold 节点连续多少次探测失败才判定为故障。
+	AlertFailThreshold int `json:"alertFailThreshold"`
+}
+
+// 节点故障判定的连续失败次数。
+const (
+	DefaultAlertFailThreshold = 3
+	MinAlertFailThreshold     = 1
+	MaxAlertFailThreshold     = 10
+)
+
+func DefaultTGConfig() TGConfig {
+	return TGConfig{
+		AlertNodes:         true,
+		AlertErrors:        true,
+		AlertFailThreshold: DefaultAlertFailThreshold,
+	}
+}
+
+// Configured 表示 Token 与 Chat ID 都已填写，通知渠道至少具备发送条件。
+func (c TGConfig) Configured() bool {
+	return strings.TrimSpace(c.Token) != "" && strings.TrimSpace(c.Chat) != ""
+}
+
+// NodeAlertsOn 表示节点故障/恢复告警应当发送。
+func (c TGConfig) NodeAlertsOn() bool {
+	return c.Enabled && c.AlertNodes && c.Configured()
+}
+
+// ErrorAlertsOn 表示程序错误告警应当发送。
+func (c TGConfig) ErrorAlertsOn() bool {
+	return c.Enabled && c.AlertErrors && c.Configured()
 }
 
 type SystemConfig struct {
@@ -158,34 +189,22 @@ type TodayStats struct {
 	Yesterday []PlayStat `json:"yesterday"`
 }
 
-type KeepaliveState struct {
-	Node           string
-	AnchorTS       int64
-	LastPlayTS     int64
-	LastNotifyDay  string
-	NotifyCountDay string
-	NotifyCount    int
-}
-
 type HostMatch struct {
 	Name   string
 	Secret string
 }
 
+// packedNode 是节点落库时的紧凑 JSON。已移除的保号字段（xd/xb/xh/xk/xco）
+// 仍可能留在老数据里，这里不再声明，解码时会被静默忽略，下一次保存时自然消失。
 type packedNode struct {
-	Target              string `json:"t,omitempty"`
-	Fav                 int    `json:"f,omitempty"`
-	Secret              string `json:"s,omitempty"`
-	Tag                 string `json:"g,omitempty"`
-	DisplayName         string `json:"d,omitempty"`
-	DirectExternal      int    `json:"de,omitempty"`
-	RenewDays           int    `json:"xd,omitempty"`
-	RemindBeforeDays    int    `json:"xb,omitempty"`
-	KeepaliveAt         string `json:"xh,omitempty"`
-	KeepaliveMaxPerDay  int    `json:"xk,omitempty"`
-	KeepaliveChangeOnly *int   `json:"xco,omitempty"`
-	Impersonate         *int   `json:"im,omitempty"`
-	ImpersonateProfile  string `json:"ip,omitempty"`
+	Target             string `json:"t,omitempty"`
+	Fav                int    `json:"f,omitempty"`
+	Secret             string `json:"s,omitempty"`
+	Tag                string `json:"g,omitempty"`
+	DisplayName        string `json:"d,omitempty"`
+	DirectExternal     int    `json:"de,omitempty"`
+	Impersonate        *int   `json:"im,omitempty"`
+	ImpersonateProfile string `json:"ip,omitempty"`
 }
 
 func PackNode(node Node) (string, error) {
@@ -194,9 +213,6 @@ func PackNode(node Node) (string, error) {
 		Secret:             node.Secret,
 		Tag:                node.Tag,
 		DisplayName:        node.DisplayName,
-		RenewDays:          node.RenewDays,
-		RemindBeforeDays:   node.RemindBeforeDays,
-		KeepaliveAt:        node.KeepaliveAt,
 		ImpersonateProfile: "",
 	}
 	if node.Fav {
@@ -204,13 +220,6 @@ func PackNode(node Node) (string, error) {
 	}
 	if node.DirectExternal {
 		p.DirectExternal = 1
-	}
-	if node.KeepaliveMaxPerDay != 0 && node.KeepaliveMaxPerDay != 1 {
-		p.KeepaliveMaxPerDay = node.KeepaliveMaxPerDay
-	}
-	if !node.KeepaliveChangeOnly {
-		v := 0
-		p.KeepaliveChangeOnly = &v
 	}
 	if !node.Impersonate {
 		v := 0
@@ -229,20 +238,15 @@ func UnpackNode(name, packed string) (Node, bool) {
 		return Node{}, false
 	}
 	return Node{
-		Name:                name,
-		Target:              p.Target,
-		Fav:                 p.Fav != 0,
-		Secret:              p.Secret,
-		Tag:                 p.Tag,
-		DisplayName:         p.DisplayName,
-		DirectExternal:      p.DirectExternal != 0,
-		RenewDays:           p.RenewDays,
-		RemindBeforeDays:    p.RemindBeforeDays,
-		KeepaliveAt:         p.KeepaliveAt,
-		KeepaliveMaxPerDay:  defaultInt(p.KeepaliveMaxPerDay, 1),
-		KeepaliveChangeOnly: p.KeepaliveChangeOnly == nil || *p.KeepaliveChangeOnly != 0,
-		Impersonate:         p.Impersonate == nil || *p.Impersonate != 0,
-		ImpersonateProfile:  defaultString(p.ImpersonateProfile, "yamby"),
+		Name:               name,
+		Target:             p.Target,
+		Fav:                p.Fav != 0,
+		Secret:             p.Secret,
+		Tag:                p.Tag,
+		DisplayName:        p.DisplayName,
+		DirectExternal:     p.DirectExternal != 0,
+		Impersonate:        p.Impersonate == nil || *p.Impersonate != 0,
+		ImpersonateProfile: defaultString(p.ImpersonateProfile, "yamby"),
 	}, true
 }
 
@@ -302,13 +306,6 @@ func QueryValue(u *url.URL, names ...string) string {
 		}
 	}
 	return ""
-}
-
-func defaultInt(value, fallback int) int {
-	if value == 0 {
-		return fallback
-	}
-	return value
 }
 
 func defaultString(value, fallback string) string {

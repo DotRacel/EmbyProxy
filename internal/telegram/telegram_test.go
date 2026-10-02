@@ -318,43 +318,6 @@ func TestCheckAndSendReportSkipsWhenReportDisabled(t *testing.T) {
 	}
 }
 
-func TestCheckKeepaliveAndNotifyIgnoresReportDisabled(t *testing.T) {
-	ctx := context.Background()
-	store := newTelegramTestStore(t)
-	if err := store.SaveTGConfig(ctx, storage.TGConfig{
-		Enabled:       true,
-		ReportEnabled: false,
-		Token:         "token",
-		Chat:          "chat",
-	}); err != nil {
-		t.Fatalf("SaveTGConfig() error = %v", err)
-	}
-	if err := store.SaveNode(ctx, "admin", storage.Node{
-		Name:             "alpha",
-		Target:           "http://example.test",
-		DisplayName:      "Alpha",
-		RenewDays:        1,
-		RemindBeforeDays: 1,
-		KeepaliveAt:      "00:00",
-	}); err != nil {
-		t.Fatalf("SaveNode() error = %v", err)
-	}
-
-	calls := 0
-	service := New(store, logging.New("silent", false))
-	service.http = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		calls++
-		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
-	})}
-
-	if err := service.CheckKeepaliveAndNotify(ctx); err != nil {
-		t.Fatalf("CheckKeepaliveAndNotify() error = %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("telegram calls = %d, want 1", calls)
-	}
-}
-
 func newTelegramTestStore(t *testing.T) *storage.Store {
 	t.Helper()
 	store, err := storage.New(filepath.Join(t.TempDir(), "test.db"))

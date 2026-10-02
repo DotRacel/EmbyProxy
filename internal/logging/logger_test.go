@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -707,5 +708,134 @@ func assertLineOrder(t *testing.T, line string, fragments []string) {
 			t.Fatalf("line = %q, fragment %q appeared out of order", line, fragment)
 		}
 		last = idx
+	}
+}
+
+func TestObserveErrorsReceivesOnlyErrorEntries(t *testing.T) {
+	// 观察者与控制台等级无关：silent 也照样收到 ERROR。
+	l := New("silent", false)
+	var got []ErrorRecord
+	cancel := l.ObserveErrors(func(rec ErrorRecord) { got = append(got, rec) })
+
+	l.Warn("proxy", "target failed", map[string]any{"event": "targetFailed", "error": "boom"})
+	l.Error("storage", "write failed", map[string]any{"event": "dbWriteFailed", "error": `Get "https://emby.example/x?api_key=secret": disk full`})
+
+	if len(got) != 1 {
+		t.Fatalf("observed %d records, want 1 (warn must be skipped)", len(got))
+	}
+	rec := got[0]
+	if rec.Scope != "storage" || rec.Message != "write failed" || rec.Event != "dbWriteFailed" || rec.Time.IsZero() {
+		t.Fatalf("record = %+v", rec)
+	}
+	if strings.Contains(rec.Error, "secret") || !strings.Contains(rec.Error, "disk full") {
+		t.Fatalf("record error should be redacted: %q", rec.Error)
+	}
+
+	cancel()
+	l.Error("storage", "write failed", nil)
+	if len(got) != 1 {
+		t.Fatal("cancelled observer still received records")
+	}
+}
+
+func TestObserveErrorsMayLogWithoutDeadlock(t *testing.T) {
+	l := New("silent", false)
+	done := make(chan struct{})
+	l.ObserveErrors(func(rec ErrorRecord) {
+		// 观察者在日志锁之外调用，里面再写日志不能卡死。
+		l.Warn("alert", "observed", map[string]any{"scope": rec.Scope})
+		close(done)
+	})
+	l.Error("scheduler", "cleanup panic", nil)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("observer deadlocked")
+	}
+}
+
+func TestErrorThrottledLimitsConsoleButCountsEveryCall(t *testing.T) {
+	l := New("silent", false)
+	observed := 0
+	l.ObserveErrors(func(ErrorRecord) { observed++ })
+	meta := func() map[string]any { return map[string]any{"event": "dbWriteFailed", "error": "disk full"} }
+
+	for i := 0; i < 5; i++ {
+		l.ErrorThrottled(time.Hour, "playback", "write failed", meta())
+	}
+	l.ErrorThrottled(time.Hour, "playback", "other failed", map[string]any{"event": "otherFailed"})
+	if observed != 6 {
+		t.Fatalf("observed = %d, want every call (6) counted for alerts", observed)
+	}
+	if entries := l.Entries(100); len(entries) != 2 {
+		t.Fatalf("console entries = %d, want 2 (one per event key)", len(entries))
+	}
+
+	// 间隔过后下一条照常写出，并带上期间压下的条数。
+	l.ErrorThrottled(0, "playback", "write failed", meta())
+	entries := l.Entries(100)
+	if last := entries[len(entries)-1]; !strings.Contains(last.Line, "suppressed=4") || last.Level != "error" {
+		t.Fatalf("last entry = %+v, want suppressed=4", last)
+	}
+}
+
+func TestHistoryWriteFailureIsReportedOnceAndRecovers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "console.jsonl")
+	l := New("silent", false)
+	if err := l.EnableHistory(path, 1000, 2); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	observed := 0
+	l.ObserveErrors(func(rec ErrorRecord) {
+		if rec.Scope == "logging" {
+			observed++
+		}
+	})
+
+	l.Info("test", "first", nil)
+	// 模拟持久性写入故障：当前句柄失效，日志文件的位置又变成了打不开的目录。
+	l.history.mu.Lock()
+	_ = l.history.file.Close()
+	l.history.writer = bufio.NewWriterSize(l.history.file, 1)
+	l.history.mu.Unlock()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 20; i++ {
+		l.Info("test", fmt.Sprintf("line %d", i), nil)
+	}
+	failures := 0
+	for _, entry := range l.Entries(1000) {
+		if entry.Scope == "logging" && entry.Level == "error" {
+			failures++
+		}
+	}
+	if failures != 1 {
+		t.Fatalf("history failure entries = %d, want exactly 1 (throttled, no feedback loop)", failures)
+	}
+	if observed < 2 {
+		t.Fatalf("observed history failures = %d, want each failed write counted", observed)
+	}
+
+	// 出错的写入器被丢掉，故障排除后下一次写入重新打开文件，历史继续可用。
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	l.Info("test", "after recovery", nil)
+	if err := l.history.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "after recovery") {
+		t.Fatalf("history did not recover: %q", data)
 	}
 }

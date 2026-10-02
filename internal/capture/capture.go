@@ -453,12 +453,12 @@ func (r *Recorder) appendRecord(record Record, cfg storage.SystemConfig) {
 
 func (r *Recorder) appendRecordLocked(file string, record Record) {
 	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
-		r.log.Warn("traffic", "capture mkdir failed", map[string]any{"event": "captureMkdirFailed", "error": err.Error()})
+		r.log.ErrorThrottled(time.Minute, "traffic", "capture mkdir failed", map[string]any{"event": "captureMkdirFailed", "error": err.Error()})
 		return
 	}
 	f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
-		r.log.Warn("traffic", "capture open failed", map[string]any{"event": "captureOpenFailed", "error": err.Error()})
+		r.log.ErrorThrottled(time.Minute, "traffic", "capture open failed", map[string]any{"event": "captureOpenFailed", "error": err.Error()})
 		return
 	}
 	defer f.Close()
@@ -468,7 +468,8 @@ func (r *Recorder) appendRecordLocked(file string, record Record) {
 		return
 	}
 	if _, err := f.Write(append(b, '\n')); err != nil {
-		r.log.Warn("traffic", "capture write failed", map[string]any{"event": "captureWriteFailed", "error": err.Error()})
+		// 记录开启时每个请求都会写一次，目录不可写或磁盘满时节流后报 ERROR。
+		r.log.ErrorThrottled(time.Minute, "traffic", "capture write failed", map[string]any{"event": "captureWriteFailed", "error": err.Error()})
 	}
 }
 

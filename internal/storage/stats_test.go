@@ -1123,16 +1123,6 @@ func TestLogPlaybackAsyncUsesOccurredAtForStatsTime(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-
-	var lastPlayAt int64
-	if err := store.db.QueryRowContext(ctx, `
-		SELECT last_play_ts FROM keepalive_state WHERE node = ?
-	`, "admin:occurred").Scan(&lastPlayAt); err != nil {
-		t.Fatalf("query keepalive_state error = %v", err)
-	}
-	if lastPlayAt != occurredAt {
-		t.Fatalf("last_play_ts = %d; want %d", lastPlayAt, occurredAt)
-	}
 }
 
 func TestGetPlayStatsUsesUTC8CalendarWindow(t *testing.T) {
