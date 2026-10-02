@@ -1,6 +1,22 @@
-# EmbyProxy
-
-EmbyProxy 是一个用于管理和转发 Emby 节点请求的代理程序，提供 Web 管理界面、节点配置、转发规则和运行状态管理。
+<div align="center">
+  <img src="assets/logo.svg" width="96" height="96" alt="EmbyProxy">
+  <h1>EmbyProxy</h1>
+  <p>用一个入口代理多台 Emby 服务器：多线路故障转移、逐线路探测与故障告警，自带 Web 管理面板。</p>
+  <p>
+    <a href="https://github.com/DotRacel/EmbyProxy/tags"><img src="https://img.shields.io/github/v/tag/DotRacel/EmbyProxy?sort=semver&label=release&style=flat-square&color=8f80f5" alt="release"></a>
+    <a href="https://github.com/DotRacel/EmbyProxy/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/DotRacel/EmbyProxy/release.yml?label=docker%20build&style=flat-square" alt="docker build"></a>
+    <a href="https://github.com/DotRacel/EmbyProxy/pkgs/container/embyproxy"><img src="https://img.shields.io/badge/ghcr.io-dotracel%2Fembyproxy-2496ED?style=flat-square&logo=docker&logoColor=white" alt="ghcr.io/dotracel/embyproxy"></a>
+    <img src="https://img.shields.io/badge/platform-amd64%20%7C%20arm64-6e7681?style=flat-square" alt="platform: amd64 | arm64">
+    <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/DotRacel/EmbyProxy?style=flat-square&logo=go&logoColor=white" alt="Go version"></a>
+    <a href="#许可证"><img src="https://img.shields.io/badge/license-MIT-3ecf8e?style=flat-square" alt="license: MIT"></a>
+  </p>
+  <p>
+    <a href="#docker-compose">部署</a> ·
+    <a href="#配置">配置</a> ·
+    <a href="#访问">访问</a> ·
+    <a href="#最佳实践">最佳实践</a>
+  </p>
+</div>
 
 ![EmbyProxy 管理界面](assets/screenshot.png)
 
