@@ -260,6 +260,12 @@ func (c *imageDiskCache) get(r *http.Request, key string, reqOrigin string, env 
 	addCORSHeaders(headers, reqOrigin, env)
 	headers.Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length, Content-Type")
 	headers.Del("Vary")
+	// 存下来的 Age/Date 停在入库那一刻，原样回放的话客户端会把几周前的图当成早已过期，
+	// 每次都重新下载。删掉 Date 后由 net/http 补上当前时间；Cache-Control 按本次请求
+	// 重新算，旧条目里存的 max-age=60 也一并换掉。
+	headers.Del("Age")
+	headers.Del("Date")
+	setImageCacheControl(headers, meta.Status, imageCacheControlFor(r.URL))
 	if imageClientCacheFresh(r, headers) {
 		if !c.cachedBodyExists(paths) {
 			c.remove(paths)

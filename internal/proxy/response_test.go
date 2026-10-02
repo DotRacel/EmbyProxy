@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -3833,6 +3834,59 @@ func TestHandleMediaProxyDoesNotCacheImageErrors(t *testing.T) {
 	defer res.Body.Close()
 	if got := res.Header.Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+}
+
+func TestHandleMediaProxyImageMissDropsUpstreamAgeAndCachesByTag(t *testing.T) {
+	ctx := context.Background()
+	store := newProxyTestStore(t)
+	sys := storage.DefaultSystemConfig()
+	sys.ImageCacheEnabled = true
+	if err := store.SaveSystemConfig(ctx, sys); err != nil {
+		t.Fatal(err)
+	}
+	h := New(config.Config{CWD: t.TempDir()}, store, nil, logging.New("silent", false))
+	h.imageFollowClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return bytesResponse(http.StatusOK, []byte("image"), http.Header{
+			"Content-Type":  []string{"image/jpeg"},
+			"Age":           []string{"566758"},
+			"Cache-Control": []string{"public, max-age=14400"},
+		}), nil
+	})}
+
+	for _, tc := range []struct {
+		query string
+		want  string
+	}{
+		{query: "?tag=a", want: imageCacheControlTagged},
+		{query: "", want: imageCacheControlUntagged},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "https://proxy.example/node/emby/Items/1/Images/Primary"+tc.query, nil)
+		targetURL, err := url.Parse("https://upstream.example/emby/Items/1/Images/Primary" + tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := h.handleMediaProxy(ctx, req, storage.Node{Name: "node", Target: "https://upstream.example"}, parsedRoute{Name: "node", Path: "/emby/Items/1/Images/Primary"}, targetURL, nil, config.ProxyEnv{}, false, true, false, "", "127.0.0.1")
+		if err != nil {
+			t.Fatalf("handleMediaProxy(%q) error = %v", tc.query, err)
+		}
+		if _, err := io.Copy(io.Discard, res.Body); err != nil {
+			t.Fatal(err)
+		}
+		_ = res.Body.Close()
+		if got := res.Header.Get("Age"); got != "" {
+			t.Fatalf("%q: Age = %q, want upstream Age stripped", tc.query, got)
+		}
+		if got := res.Header.Get("Cache-Control"); got != tc.want {
+			t.Fatalf("%q: Cache-Control = %q, want %q", tc.query, got, tc.want)
+		}
+		data, err := os.ReadFile(h.ensureImageCache(ctx).paths(imageCacheKey("node", targetURL)).meta)
+		if err != nil {
+			t.Fatalf("%q: cache metadata not written: %v", tc.query, err)
+		}
+		if strings.Contains(string(data), `"Age"`) {
+			t.Fatalf("%q: cache metadata stored upstream Age: %s", tc.query, data)
+		}
 	}
 }
 

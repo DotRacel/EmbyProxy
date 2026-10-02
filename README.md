@@ -105,6 +105,24 @@ http://服务器地址:8787/节点名/
 
 如果节点配置了密钥，路径中还需要包含密钥。
 
+## 最佳实践
+
+### 前置 Caddy 时关闭 HTTP/3
+
+Caddy 默认开启 HTTP/3（QUIC，走 UDP 443），并通过 `Alt-Svc` 响应头让客户端改用它。国内运营商经常对出境 UDP 限速或丢包，而 HTTP/3 会把同一客户端的所有请求复用在一条 UDP 连接上。这条连接一旦被掐断，海报墙上的图片会全部同时加载失败，即使 EmbyProxy 已经从缓存里返回了图片，也送不到客户端。
+
+在 Caddyfile 开头加上全局配置，只保留走 TCP 的 HTTP/1.1 和 HTTP/2：
+
+```caddyfile
+{
+	servers {
+		protocols h1 h2
+	}
+}
+```
+
+修改后执行 `systemctl reload caddy` 生效。这项配置对这台 Caddy 上的所有站点都生效。客户端可能还记着之前收到的 `Alt-Svc`（Caddy 默认有效期 30 天），但 Caddy 不再监听 UDP 443 后，客户端通常会很快回退到 HTTP/2。
+
 ## 许可证
 
 本项目采用 MIT License 开源。

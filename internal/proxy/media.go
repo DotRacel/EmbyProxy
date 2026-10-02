@@ -329,7 +329,10 @@ func (h *Handler) handleMediaProxy(ctx context.Context, r *http.Request, node st
 	if isImageAPI {
 		headers.Del("Set-Cookie")
 		headers.Del("Vary")
-		setImageCacheControl(headers, res.StatusCode, "public, max-age=60, s-maxage=60")
+		// 上游（如 Cloudflare）的 Age 是相对它自己的缓存策略算的；Cache-Control 已换成我们的，
+		// 留着 Age 会让客户端以为图片早就过期。删掉后也不会被写进磁盘缓存。
+		headers.Del("Age")
+		setImageCacheControl(headers, res.StatusCode, imageCacheControlFor(r.URL))
 		if imageCache != nil {
 			if imageCache.wrapStore(r, cacheKey, res, headers, finishImageCacheFill) {
 				finishImageCacheFill = func() {}
@@ -927,6 +930,32 @@ func isSystemInfoAddressKey(key string) bool {
 	default:
 		return false
 	}
+}
+
+const (
+	imageCacheControlUntagged = "public, max-age=60, s-maxage=60"
+	// Emby 的图片 URL 用 tag 标版本：图片一换 tag 就变，同一个带 tag 的 URL 内容不会变，
+	// 客户端可以放心长缓存，海报墙再打开时直接走本地缓存，不必每次都过网络。
+	imageCacheControlTagged = "public, max-age=2592000, s-maxage=2592000, immutable"
+)
+
+// imageCacheControlFor 按客户端请求里有没有非空的 tag 参数选图片的 Cache-Control。
+// 参数名大小写不敏感：不同客户端有写 tag 的也有写 Tag 的。
+func imageCacheControlFor(u *url.URL) string {
+	if u == nil {
+		return imageCacheControlUntagged
+	}
+	for key, values := range u.Query() {
+		if !strings.EqualFold(key, "tag") {
+			continue
+		}
+		for _, value := range values {
+			if strings.TrimSpace(value) != "" {
+				return imageCacheControlTagged
+			}
+		}
+	}
+	return imageCacheControlUntagged
 }
 
 func setImageCacheControl(headers http.Header, status int, cacheValue string) {

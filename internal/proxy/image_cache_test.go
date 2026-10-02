@@ -239,6 +239,75 @@ func TestImageDiskCacheValidatesBodyBeforeFreshClientResponse(t *testing.T) {
 	}
 }
 
+// Entries written before Age was stripped still carry the upstream Age/Date and the
+// old max-age=60; replaying those made every hit look long expired to the client.
+func TestImageDiskCacheHitReplacesStaleFreshnessHeaders(t *testing.T) {
+	dir := t.TempDir()
+	key := "node\nhttps://upstream.example/emby/Items/1/Images/Primary?tag=v1"
+	writer := newImageDiskCache(dir, time.Hour, 0)
+	res := bytesResponse(http.StatusOK, []byte("image"), http.Header{
+		"Content-Type":  []string{"image/jpeg"},
+		"Age":           []string{"1538699"},
+		"Date":          []string{"Sun, 30 Aug 2026 07:12:40 GMT"},
+		"Cache-Control": []string{imageCacheControlUntagged},
+	})
+	if !writer.wrapStore(httptestRequest(http.MethodGet), key, res, res.Header) {
+		t.Fatal("image cache did not wrap cacheable response")
+	}
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+
+	cache := newImageDiskCache(dir, time.Hour, 0)
+	for _, tc := range []struct {
+		url  string
+		want string
+	}{
+		{url: "https://proxy.example/node/emby/Items/1/Images/Primary?tag=v1", want: imageCacheControlTagged},
+		{url: "https://proxy.example/node/emby/Items/1/Images/Primary", want: imageCacheControlUntagged},
+	} {
+		req, err := http.NewRequest(http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cached, ok := cache.get(req, key, "", config.ProxyEnv{})
+		if !ok {
+			t.Fatalf("%s: cache lookup missed", tc.url)
+		}
+		_ = cached.Body.Close()
+		if got := cached.Header.Get("Age"); got != "" {
+			t.Fatalf("%s: Age = %q, want stripped", tc.url, got)
+		}
+		if got := cached.Header.Get("Date"); got != "" {
+			t.Fatalf("%s: Date = %q, want stripped so net/http writes the current time", tc.url, got)
+		}
+		if got := cached.Header.Get("Cache-Control"); got != tc.want {
+			t.Fatalf("%s: Cache-Control = %q, want %q", tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestImageCacheControlForRequiresNonEmptyTag(t *testing.T) {
+	for _, tc := range []struct {
+		rawURL string
+		want   string
+	}{
+		{rawURL: "https://proxy.example/emby/Items/1/Images/Primary?tag=abc&quality=90", want: imageCacheControlTagged},
+		{rawURL: "https://proxy.example/emby/Items/1/Images/Primary?Tag=abc", want: imageCacheControlTagged},
+		{rawURL: "https://proxy.example/emby/Items/1/Images/Primary?tag=", want: imageCacheControlUntagged},
+		{rawURL: "https://proxy.example/emby/Items/1/Images/Primary?quality=90", want: imageCacheControlUntagged},
+	} {
+		u, err := url.Parse(tc.rawURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := imageCacheControlFor(u); got != tc.want {
+			t.Fatalf("imageCacheControlFor(%q) = %q, want %q", tc.rawURL, got, tc.want)
+		}
+	}
+}
+
 func httptestRequest(method string) *http.Request {
 	req, _ := http.NewRequest(method, "https://proxy.example/image", nil)
 	return req
